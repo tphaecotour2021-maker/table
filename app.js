@@ -3,6 +3,7 @@ const API_BASE = "/.netlify/functions";
 const LOCAL_DB_KEY = "event-registration-browser-db";
 const LOCAL_PASSWORD_KEY = "event-registration-browser-password";
 const DEFAULT_ADMIN_PASSWORD = "admin1234";
+let inMemoryDatabase = { events: [] };
 
 const QUESTION_TYPE_OPTIONS = [
   { value: "shortText", label: "簡答" },
@@ -19,6 +20,14 @@ const QUESTION_TYPE_OPTIONS = [
 const OPTION_TYPES = new Set(["singleChoice", "multiChoice", "dropdown"]);
 const BRANCHING_TYPES = new Set(["singleChoice", "multiChoice", "dropdown"]);
 
+function readSessionPassword() {
+  try {
+    return sessionStorage.getItem("event-admin-password") || "";
+  } catch {
+    return "";
+  }
+}
+
 const state = {
   apiMode: "loading",
   public: {
@@ -30,7 +39,7 @@ const state = {
   admin: {
     open: false,
     authenticated: false,
-    password: sessionStorage.getItem("event-admin-password") || "",
+    password: readSessionPassword(),
     events: [],
     draft: null,
     selectedEventId: null,
@@ -40,6 +49,8 @@ const state = {
     deleting: false,
     usingDefaultPassword: false,
     loginError: "",
+    collapsedPages: {},
+    collapsedQuestions: {},
   },
   storageSummary: {
     modeLabel: "檢查中",
@@ -50,11 +61,10 @@ const state = {
 const dom = {
   openAdmin: document.querySelector("#open-admin"),
   closeAdmin: document.querySelector("#close-admin"),
-  refreshEvents: document.querySelector("#refresh-events"),
   eventList: document.querySelector("#event-list"),
   publicDetail: document.querySelector("#public-detail"),
-  heroMetrics: document.querySelector("#hero-metrics"),
-  storageIndicator: document.querySelector("#storage-indicator"),
+  publicOverlay: document.querySelector("#public-overlay"),
+  closePublic: document.querySelector("#close-public"),
   adminOverlay: document.querySelector("#admin-overlay"),
   adminRoot: document.querySelector("#admin-root"),
   toast: document.querySelector("#toast"),
@@ -289,14 +299,19 @@ function readLocalDatabase() {
   try {
     const raw = localStorage.getItem(LOCAL_DB_KEY);
     if (!raw) {
-      return { events: [] };
+      return {
+        events: inMemoryDatabase.events.map((event) => normalizeEvent(event)),
+      };
     }
 
     const parsed = JSON.parse(raw);
     const events = Array.isArray(parsed?.events) ? parsed.events.map((event) => normalizeEvent(event)) : [];
+    inMemoryDatabase = { events: events.map((event) => normalizeEvent(event)) };
     return { events };
   } catch {
-    return { events: [] };
+    return {
+      events: inMemoryDatabase.events.map((event) => normalizeEvent(event)),
+    };
   }
 }
 
@@ -304,12 +319,23 @@ function writeLocalDatabase(database) {
   const normalized = {
     events: database.events.map((event) => normalizeEvent(event)),
   };
-  localStorage.setItem(LOCAL_DB_KEY, JSON.stringify(normalized));
+  inMemoryDatabase = {
+    events: normalized.events.map((event) => normalizeEvent(event)),
+  };
+  try {
+    localStorage.setItem(LOCAL_DB_KEY, JSON.stringify(normalized));
+  } catch {
+    return inMemoryDatabase;
+  }
   return normalized;
 }
 
 function getLocalAdminPassword() {
-  return localStorage.getItem(LOCAL_PASSWORD_KEY) || DEFAULT_ADMIN_PASSWORD;
+  try {
+    return localStorage.getItem(LOCAL_PASSWORD_KEY) || DEFAULT_ADMIN_PASSWORD;
+  } catch {
+    return DEFAULT_ADMIN_PASSWORD;
+  }
 }
 
 function sanitizeEventForPublic(event) {
@@ -532,7 +558,9 @@ function cleanFlowReferences(event) {
     for (const question of page.questions) {
       if (!supportsOptions(question.type)) {
         question.options = [];
-        question.countsTowardCapacity = false;
+        if (question.type !== "number") {
+          question.countsTowardCapacity = false;
+        }
         continue;
       }
 
@@ -819,6 +847,16 @@ function ensureRunnerForEvent(eventId) {
 function selectPublicEvent(eventId) {
   state.public.selectedEventId = eventId;
   ensureRunnerForEvent(eventId);
+  dom.publicOverlay.classList.remove("hidden");
+  dom.publicOverlay.setAttribute("aria-hidden", "false");
+  renderPublic();
+}
+
+function closePublicEvent() {
+  state.public.selectedEventId = null;
+  state.public.runner = null;
+  dom.publicOverlay.classList.add("hidden");
+  dom.publicOverlay.setAttribute("aria-hidden", "true");
   renderPublic();
 }
 
@@ -831,17 +869,16 @@ async function loadPublicEvents({ preserveSelection = true } = {}) {
     state.public.events = payload.events || [];
 
     if (!preserveSelection) {
-      state.public.selectedEventId = state.public.events[0]?.id || null;
+      state.public.selectedEventId = null;
       state.public.runner = null;
     } else if (state.public.selectedEventId) {
       const stillExists = state.public.events.some((event) => event.id === state.public.selectedEventId);
       if (!stillExists) {
-        state.public.selectedEventId = state.public.events[0]?.id || null;
+        state.public.selectedEventId = null;
         state.public.runner = null;
+        dom.publicOverlay.classList.add("hidden");
+        dom.publicOverlay.setAttribute("aria-hidden", "true");
       }
-    } else {
-      state.public.selectedEventId = state.public.events[0]?.id || null;
-      state.public.runner = null;
     }
 
     if (state.public.selectedEventId) {
@@ -855,51 +892,11 @@ async function loadPublicEvents({ preserveSelection = true } = {}) {
   }
 }
 
-function renderStorageIndicator() {
-  dom.storageIndicator.innerHTML = `
-    <div>
-      <p class="section-eyebrow">資料模式</p>
-      <h3>${escapeHtml(state.storageSummary.modeLabel)}</h3>
-    </div>
-    <p class="metric-note">${escapeHtml(state.storageSummary.detail)}</p>
-    <div class="meta-row">
-      <span class="meta-pill">${state.apiMode === "remote" ? "多人可共用" : "單機示範"}</span>
-      <span class="meta-pill">${state.apiMode === "remote" ? "API 啟用中" : "本機 fallback"}</span>
-    </div>
-  `;
-}
-
-function renderHeroMetrics() {
-  const events = state.public.events;
-  const remainingTracked = events.filter((event) => event.remainingCapacity != null);
-  const pageCount = events.reduce((sum, event) => sum + event.pages.length, 0);
-
-  dom.heroMetrics.innerHTML = `
-    <div class="metric">
-      <p class="metric-label">已發布活動</p>
-      <div class="metric-value">${events.length}</div>
-      <p class="metric-note">前台目前可看到的活動數量</p>
-    </div>
-    <div class="metric">
-      <p class="metric-label">流程頁數</p>
-      <div class="metric-value">${pageCount}</div>
-      <p class="metric-note">已建立的表單頁面總數</p>
-    </div>
-    <div class="metric">
-      <p class="metric-label">可控管名額</p>
-      <div class="metric-value">${remainingTracked.length}</div>
-      <p class="metric-note">${escapeHtml(summarizeRemainingCapacity(events))}</p>
-    </div>
-  `;
-}
-
 function renderEventList() {
   if (state.public.loading) {
     dom.eventList.innerHTML = `
       <div class="empty-state">
-        <p class="section-eyebrow">載入中</p>
-        <h3>正在整理活動列表</h3>
-        <p class="muted-text">稍等一下，活動資料快好了。</p>
+        <h3>載入中</h3>
       </div>
     `;
     return;
@@ -908,9 +905,7 @@ function renderEventList() {
   if (state.public.events.length === 0) {
     dom.eventList.innerHTML = `
       <div class="empty-state">
-        <p class="section-eyebrow">目前沒有活動</p>
-        <h3>先去後台建立第一個活動</h3>
-        <p class="muted-text">建立活動、設定頁面與題目後，這裡就會出現報名表單。</p>
+        <h3>目前沒有可報名活動</h3>
       </div>
     `;
     return;
@@ -921,33 +916,29 @@ function renderEventList() {
       const isSelected = event.id === state.public.selectedEventId;
       const remaining = event.remainingCapacity;
       const isFull = remaining === 0;
+      const actionLabel = isFull ? "查看活動" : "立即報名";
 
       return `
-        <article class="event-card ${isSelected ? "selected" : ""}">
+        <article class="event-card ${isSelected ? "selected" : ""}" data-event-action="open" data-event-id="${event.id}">
           <div class="event-cover">
             ${
               event.coverImage
-                ? `<img src="${event.coverImage}" alt="${escapeHtml(event.title)} 封面" />`
+                ? `<img data-image-role="event-card" data-event-id="${event.id}" alt="${escapeHtml(event.title)} 封面" />`
                 : ""
             }
-          </div>
-          <div class="event-card-body">
-            <div>
-              <div class="chip-row">
+            <div class="event-cover-content">
+              <div class="chip-row event-card-chips">
                 <span class="status-pill ${isFull ? "full" : "live"}">${isFull ? "名額已滿" : "可報名"}</span>
-                <span class="meta-pill">${event.pages.length} 頁流程</span>
                 <span class="meta-pill">${remaining == null ? "不限名額" : `剩餘 ${remaining} 人`}</span>
               </div>
-              <h4>${escapeHtml(event.title)}</h4>
-              <p class="event-description">${escapeHtml(event.description || "尚未填寫活動說明。")}</p>
+              <h4 class="event-card-title">${escapeHtml(event.title)}</h4>
             </div>
-            <div class="meta-row">
-              <span class="meta-pill">上限 ${formatCapacity(event.capacity)}</span>
-              <span class="meta-pill">更新於 ${formatDate(event.updatedAt)}</span>
-            </div>
-            <div class="action-row">
-              <button class="primary-button" type="button" data-event-action="open" data-event-id="${event.id}">
-                ${isSelected ? "查看報名流程" : "查看活動"}
+          </div>
+            <div class="event-card-body">
+            ${event.description ? `<p class="event-description">${escapeHtml(event.description)}</p>` : ""}
+            <div class="action-row event-card-footer">
+              <button class="primary-button event-card-button" type="button" data-event-action="open" data-event-id="${event.id}">
+                ${isSelected ? "開啟報名" : actionLabel}
               </button>
             </div>
           </div>
@@ -1042,15 +1033,7 @@ function renderPublicDetail() {
   const event = getSelectedPublicEvent();
 
   if (!event) {
-    dom.publicDetail.innerHTML = `
-      <div class="registration-shell">
-        <div class="empty-state">
-          <p class="section-eyebrow">活動詳情</p>
-          <h3>選一個活動開始看表單</h3>
-          <p class="muted-text">右邊會顯示活動資訊、頁面流程與可填寫的報名表。</p>
-        </div>
-      </div>
-    `;
+    dom.publicDetail.innerHTML = "";
     return;
   }
 
@@ -1061,31 +1044,24 @@ function renderPublicDetail() {
     dom.publicDetail.innerHTML = `
       <div class="registration-shell">
         <div class="registration-cover">
-          ${event.coverImage ? `<img src="${event.coverImage}" alt="${escapeHtml(event.title)} 封面" />` : ""}
+          ${event.coverImage ? `<img data-image-role="public-detail" data-event-id="${event.id}" alt="${escapeHtml(event.title)} 封面" />` : ""}
         </div>
-        <p class="section-eyebrow">報名完成</p>
         <h3>${escapeHtml(event.title)}</h3>
-        <p class="event-description-inline">已送出成功，這次送出的總報名人數為 ${runner.success?.totalParticipants || 1} 人。</p>
-        <div class="hero-metrics">
-          <div class="metric">
-            <p class="metric-label">總表單數</p>
-            <div class="metric-value">${runner.success?.summary?.totalForms ?? "-"}</div>
-            <p class="metric-note">目前累積送出的報名單數</p>
-          </div>
-          <div class="metric">
-            <p class="metric-label">總報名人數</p>
-            <div class="metric-value">${runner.success?.summary?.totalParticipants ?? "-"}</div>
-            <p class="metric-note">以你指定的人數欄位累計</p>
-          </div>
-          <div class="metric">
-            <p class="metric-label">剩餘名額</p>
-            <div class="metric-value">${runner.success?.summary?.remainingCapacity == null ? "∞" : runner.success.summary.remainingCapacity}</div>
-            <p class="metric-note">如果活動設了上限，會即時扣除</p>
-          </div>
+        <div class="meta-row" style="margin-top: 16px;">
+          <span class="status-pill live">報名完成</span>
+          <span class="meta-pill">${runner.success?.totalParticipants || 1} 人</span>
+          ${
+            runner.success?.summary?.remainingCapacity == null
+              ? ""
+              : `<span class="meta-pill">剩餘 ${runner.success.summary.remainingCapacity} 人</span>`
+          }
         </div>
         <div class="action-row" style="margin-top: 24px;">
           <button class="secondary-button" type="button" data-public-action="restart">
             再填一張報名單
+          </button>
+          <button class="text-button" type="button" data-public-action="close">
+            關閉
           </button>
         </div>
       </div>
@@ -1107,20 +1083,23 @@ function renderPublicDetail() {
   dom.publicDetail.innerHTML = `
     <div class="registration-shell">
       <div class="registration-cover">
-        ${event.coverImage ? `<img src="${event.coverImage}" alt="${escapeHtml(event.title)} 封面" />` : ""}
+        ${event.coverImage ? `<img data-image-role="public-detail" data-event-id="${event.id}" alt="${escapeHtml(event.title)} 封面" />` : ""}
       </div>
       <div class="chip-row">
         <span class="status-pill ${isFull ? "full" : "live"}">${isFull ? "名額已滿" : "開放報名"}</span>
-        <span class="meta-pill">${event.pages.length} 頁流程</span>
-        <span class="meta-pill">${event.remainingCapacity == null ? "不限名額" : `剩餘 ${event.remainingCapacity} 人`}</span>
+        ${
+          event.remainingCapacity == null
+            ? ""
+            : `<span class="meta-pill">剩餘 ${event.remainingCapacity} 人</span>`
+        }
       </div>
       <h3 style="margin-top: 14px;">${escapeHtml(event.title)}</h3>
-      <p class="event-description-inline">${nl2br(event.description || "尚未填寫活動說明。")}</p>
+      ${event.description ? `<p class="event-description-inline">${nl2br(event.description)}</p>` : ""}
       <div class="progress-track">
         <div class="progress-bar" style="width: ${progress}%"></div>
       </div>
       <div class="meta-row">
-        <span class="meta-pill">第 ${currentPageIndex + 1} / ${event.pages.length} 頁</span>
+        <span class="meta-pill">${currentPageIndex + 1} / ${event.pages.length}</span>
         <span class="meta-pill">${escapeHtml(currentPage.title)}</span>
       </div>
       ${
@@ -1130,7 +1109,7 @@ function renderPublicDetail() {
       }
       ${
         isFull
-          ? `<div class="empty-state" style="margin-top: 20px;"><h3>這個活動目前已經額滿</h3><p class="muted-text">你仍然可以在後台調整名額上限或改成草稿。</p></div>`
+          ? `<div class="empty-state" style="margin-top: 20px;"><h3>這個活動目前已額滿</h3></div>`
           : `
             ${(currentPage.questions || [])
               .map((question) => {
@@ -1141,8 +1120,6 @@ function renderPublicDetail() {
                     <div class="question-label">
                       <span>${escapeHtml(question.label)}</span>
                       ${question.required ? `<span class="required-badge">*</span>` : ""}
-                      <span class="answer-type-pill">${escapeHtml(getQuestionTypeLabel(question.type))}</span>
-                      ${question.countsTowardCapacity ? `<span class="logic-pill">計入總人數</span>` : ""}
                     </div>
                     ${question.helpText ? `<p class="field-help">${nl2br(question.helpText)}</p>` : ""}
                     <div style="margin-top: 12px;">
@@ -1168,6 +1145,7 @@ function renderPublicDetail() {
                 }
               </button>
               <button class="text-button" type="button" data-public-action="restart">重新開始</button>
+              <button class="text-button" type="button" data-public-action="close">關閉</button>
             </div>
           `
       }
@@ -1176,24 +1154,38 @@ function renderPublicDetail() {
 }
 
 function renderPublic() {
-  renderStorageIndicator();
-  renderHeroMetrics();
   renderEventList();
   renderPublicDetail();
+  hydratePublicImages();
+}
+
+function hydratePublicImages() {
+  const imageNodes = document.querySelectorAll("[data-image-role][data-event-id]");
+
+  for (const node of imageNodes) {
+    if (!(node instanceof HTMLImageElement)) {
+      continue;
+    }
+
+    const eventId = node.dataset.eventId;
+    const event = state.public.events.find((entry) => entry.id === eventId);
+    if (!event?.coverImage) {
+      continue;
+    }
+
+    if (node.src !== event.coverImage) {
+      node.src = event.coverImage;
+    }
+  }
 }
 
 function renderAdminLogin() {
-  const defaultPasswordHint =
-    state.apiMode === "local"
-      ? `本機示範模式的預設密碼是 ${DEFAULT_ADMIN_PASSWORD}。`
-      : "正式部署時請在 Netlify 環境變數設定 EVENT_ADMIN_PASSWORD。";
-
   dom.adminRoot.innerHTML = `
     <div class="login-card">
       <p class="section-eyebrow">密碼登入</p>
       <h3>輸入後台密碼</h3>
       <p class="muted-text" style="margin-top: 8px;">
-        ${escapeHtml(defaultPasswordHint)}
+        輸入密碼後即可管理活動與報名表單。
       </p>
       <form id="admin-login-form" style="margin-top: 18px;" class="field-grid">
         <div class="field">
@@ -1269,12 +1261,21 @@ function renderOptionRow(event, pageId, questionId, option) {
   `;
 }
 
+function isPageCollapsed(pageId) {
+  return Boolean(state.admin.collapsedPages?.[pageId]);
+}
+
+function isQuestionCollapsed(questionId) {
+  return Boolean(state.admin.collapsedQuestions?.[questionId]);
+}
+
 function renderQuestionEditor(event, page, question, questionIndex) {
   const canUseOptions = supportsOptions(question.type);
   const branchNote =
     question.type === "multiChoice"
       ? "複選跳頁時，系統會依照選項順序找第一個有設定目標頁的選項。"
       : "你可以直接把某個選項導向指定頁面。";
+  const collapsed = isQuestionCollapsed(question.id);
 
   return `
     <div class="question-card">
@@ -1282,14 +1283,26 @@ function renderQuestionEditor(event, page, question, questionIndex) {
         <div>
           <div class="question-count">欄位 ${questionIndex + 1}</div>
           <h4>${escapeHtml(question.label || "未命名欄位")}</h4>
+          <div class="chip-row compact-row">
+            <span class="meta-pill">${escapeHtml(getQuestionTypeLabel(question.type))}</span>
+            ${question.required ? `<span class="meta-pill">必填</span>` : ""}
+            ${question.countsTowardCapacity ? `<span class="meta-pill">計入人數</span>` : ""}
+          </div>
         </div>
         <div class="action-row">
+          <button class="pill-button" type="button" data-admin-action="toggle-question" data-question-id="${question.id}">
+            ${collapsed ? "展開" : "收起"}
+          </button>
           <button class="pill-button" type="button" data-admin-action="move-question-up" data-page-id="${page.id}" data-question-id="${question.id}">上移</button>
           <button class="pill-button" type="button" data-admin-action="move-question-down" data-page-id="${page.id}" data-question-id="${question.id}">下移</button>
           <button class="danger-button" type="button" data-admin-action="delete-question" data-page-id="${page.id}" data-question-id="${question.id}">刪除欄位</button>
         </div>
       </div>
 
+      ${
+        collapsed
+          ? ""
+          : `
       <div class="field-grid two">
         <div class="field">
           <label>欄位名稱</label>
@@ -1353,12 +1366,15 @@ function renderQuestionEditor(event, page, question, questionIndex) {
           `
           : ""
       }
+      `
+      }
     </div>
   `;
 }
 
 function renderPageEditor(event, page, pageIndex) {
   const nextTargets = getBranchTargetOptions(event, page.id, false);
+  const collapsed = isPageCollapsed(page.id);
 
   return `
     <section class="page-card">
@@ -1366,14 +1382,25 @@ function renderPageEditor(event, page, pageIndex) {
         <div>
           <div class="page-count">頁面 ${pageIndex + 1}</div>
           <h3>${escapeHtml(page.title || "未命名頁面")}</h3>
+          <div class="chip-row compact-row">
+            <span class="meta-pill">${page.questions.length} 個欄位</span>
+            ${page.defaultNextPageId ? `<span class="meta-pill">已設定預設跳轉</span>` : ""}
+          </div>
         </div>
         <div class="action-row">
+          <button class="pill-button" type="button" data-admin-action="toggle-page" data-page-id="${page.id}">
+            ${collapsed ? "展開" : "收起"}
+          </button>
           <button class="pill-button" type="button" data-admin-action="move-page-up" data-page-id="${page.id}">上移</button>
           <button class="pill-button" type="button" data-admin-action="move-page-down" data-page-id="${page.id}">下移</button>
           <button class="danger-button" type="button" data-admin-action="delete-page" data-page-id="${page.id}">刪除頁面</button>
         </div>
       </div>
 
+      ${
+        collapsed
+          ? ""
+          : `
       <div class="field-grid two">
         <div class="field">
           <label>頁面標題</label>
@@ -1393,16 +1420,6 @@ function renderPageEditor(event, page, pageIndex) {
       </div>
 
       <div class="subtle-divider"></div>
-      <div class="editor-toolbar">
-        <div>
-          <h4>欄位清單</h4>
-          <p class="field-inline-help">你可以自由新增欄位、調整題型，或讓不同答案跳到不同頁面。</p>
-        </div>
-        <button class="secondary-button" type="button" data-admin-action="add-question" data-page-id="${page.id}">
-          新增欄位
-        </button>
-      </div>
-
       <div class="question-list" style="margin-top: 16px;">
         ${
           page.questions.length
@@ -1410,6 +1427,13 @@ function renderPageEditor(event, page, pageIndex) {
             : `<div class="empty-state"><h4>這頁還沒有欄位</h4><p class="muted-text">你可以把它當成純說明頁，或新增欄位讓使用者填寫。</p></div>`
         }
       </div>
+      <div class="action-row page-footer-actions">
+        <button class="secondary-button" type="button" data-admin-action="add-question" data-page-id="${page.id}">
+          新增欄位
+        </button>
+      </div>
+      `
+      }
     </section>
   `;
 }
@@ -1432,10 +1456,7 @@ function renderAdminEditor() {
     return `
       <div class="editor-card">
         <div class="section-header">
-          <div>
-            <p class="section-eyebrow">活動管理</p>
-            <h3>目前還沒有活動</h3>
-          </div>
+          <h3>目前還沒有活動</h3>
           <div class="action-row">
             <button class="secondary-button" type="button" data-admin-action="new-event">新增活動</button>
             <button class="text-button" type="button" data-admin-action="logout">登出</button>
@@ -1454,66 +1475,40 @@ function renderAdminEditor() {
     : [sanitizeEventForAdmin(draft), ...state.admin.events];
 
   return `
-    <div class="admin-layout">
-      <div class="admin-sidebar">
-        <div class="editor-card">
+    <div class="admin-layout admin-layout-simple">
+      <div class="admin-editor admin-editor-single">
+        <div class="editor-card admin-toolbar-card">
           <div class="section-header">
-            <div>
-              <p class="section-eyebrow">活動清單</p>
-              <h3>後台活動</h3>
-            </div>
-            <button class="secondary-button" type="button" data-admin-action="new-event">新增活動</button>
-          </div>
-          <div class="admin-sidebar-list">
-            ${
-              sidebarEvents.length
-                ? sidebarEvents
-                    .map((event) => {
-                      const isActive = event.id === state.admin.selectedEventId;
-                      return `
-                        <button class="admin-event-item ${isActive ? "active" : ""}" type="button" data-admin-action="select-event" data-event-id="${event.id}">
-                          <div class="chip-row">
-                            <span class="status-pill ${event.status === "published" ? "live" : ""}">${event.status === "published" ? "已發布" : "草稿"}</span>
-                            <span class="meta-pill">${event.totalParticipants || 0} 人</span>
-                          </div>
-                          <h4 style="margin-top: 10px;">${escapeHtml(event.title)}</h4>
-                          <p class="field-inline-help">${escapeHtml(event.description || "尚未填寫活動說明。")}</p>
-                        </button>
-                      `;
-                    })
-                    .join("")
-                : `<div class="empty-state"><h4>目前沒有活動</h4><p class="muted-text">點上方按鈕建立第一個活動。</p></div>`
-            }
-          </div>
-        </div>
-      </div>
-
-      <div class="admin-editor">
-        <div class="editor-card">
-          <div class="section-header">
-            <div>
-              <p class="section-eyebrow">目前編輯中</p>
-              <h3>${escapeHtml(draft.title)}</h3>
-              <p class="field-inline-help">儲存後前台會立即更新；草稿活動不會出現在前台。</p>
-            </div>
+            <h3>${escapeHtml(draft.title)}</h3>
             <div class="action-row">
               ${state.admin.dirty ? `<span class="logic-pill">尚未儲存</span>` : `<span class="meta-pill">已同步</span>`}
               <button class="secondary-button" type="button" data-admin-action="save-event" ${state.admin.saving ? "disabled" : ""}>
-                ${state.admin.saving ? "儲存中..." : "儲存活動"}
+                ${state.admin.saving ? "儲存中..." : "儲存"}
               </button>
+              <button class="secondary-button" type="button" data-admin-action="duplicate-event">複製副本</button>
+              <button class="secondary-button" type="button" data-admin-action="new-event">新增活動</button>
               <button class="danger-button" type="button" data-admin-action="delete-event" ${state.admin.deleting ? "disabled" : ""}>
-                ${state.admin.deleting ? "刪除中..." : "刪除活動"}
+                ${state.admin.deleting ? "刪除中..." : "刪除"}
               </button>
               <button class="text-button" type="button" data-admin-action="logout">登出</button>
             </div>
           </div>
+          <div class="admin-event-strip">
+            ${sidebarEvents
+              .map((event) => {
+                const isActive = event.id === state.admin.selectedEventId;
+                return `
+                  <button class="admin-event-pill ${isActive ? "active" : ""}" type="button" data-admin-action="select-event" data-event-id="${event.id}">
+                    <span>${escapeHtml(event.title)}</span>
+                    <span class="admin-event-pill-meta">${event.status === "published" ? "已發布" : "草稿"}</span>
+                  </button>
+                `;
+              })
+              .join("")}
+          </div>
+        </div>
 
-          ${
-            state.admin.usingDefaultPassword
-              ? `<div class="empty-state" style="margin-bottom: 16px;"><h4>提醒</h4><p class="muted-text">你目前還在用預設密碼。正式部署時請設定 Netlify 環境變數 <code>EVENT_ADMIN_PASSWORD</code>。</p></div>`
-              : ""
-          }
-
+        <div class="editor-card">
           <div class="field-grid two">
             <div class="field">
               <label>活動名稱</label>
@@ -1532,14 +1527,13 @@ function renderAdminEditor() {
             <div class="field">
               <label>名額上限</label>
               <input class="input" type="number" min="1" value="${escapeHtml(draft.capacity ?? "")}" data-event-field="capacity" placeholder="留空代表不限名額" />
-              <p class="field-inline-help">系統會用被標記為「計入總人數」的數字欄位總和扣除名額。</p>
             </div>
             <div class="field">
-              <label>已使用名額</label>
+              <label>目前統計</label>
               <div class="meta-row" style="padding-top: 10px;">
-                <span class="meta-pill">報名單 ${draft.submissions.length} 份</span>
-                <span class="meta-pill">總人數 ${computeUsedCapacity(draft)} 人</span>
-                <span class="meta-pill">剩餘 ${draft.capacity == null ? "不限" : `${computeRemainingCapacity(draft)} 人`}</span>
+                <span class="meta-pill">${draft.submissions.length} 份</span>
+                <span class="meta-pill">${computeUsedCapacity(draft)} 人</span>
+                <span class="meta-pill">${draft.capacity == null ? "不限名額" : `剩餘 ${computeRemainingCapacity(draft)} 人`}</span>
               </div>
             </div>
           </div>
@@ -1548,37 +1542,30 @@ function renderAdminEditor() {
             <label>活動說明</label>
             <textarea class="textarea" data-event-field="description">${escapeHtml(draft.description)}</textarea>
           </div>
-        </div>
 
-        <div class="editor-card">
-          <div class="section-header">
-            <div>
-              <p class="section-eyebrow">封面圖片</p>
-              <h3>活動視覺</h3>
+          <div class="subtle-divider"></div>
+
+          <div class="field-grid two admin-media-grid">
+            <div class="field">
+              <label>封面圖片</label>
+              <div class="action-row">
+                <input id="cover-upload-input" type="file" accept="image/*" />
+                ${
+                  draft.coverImage
+                    ? `<button class="text-button" type="button" data-admin-action="remove-cover">移除</button>`
+                    : ""
+                }
+              </div>
             </div>
-          </div>
-          <div class="cover-upload">
-            <div class="cover-preview">
+            <div class="cover-preview compact-cover">
               ${draft.coverImage ? `<img src="${draft.coverImage}" alt="${escapeHtml(draft.title)} 封面預覽" />` : ""}
             </div>
-            <div class="action-row">
-              <input id="cover-upload-input" type="file" accept="image/*" />
-              ${
-                draft.coverImage
-                  ? `<button class="text-button" type="button" data-admin-action="remove-cover">移除圖片</button>`
-                  : ""
-              }
-            </div>
-            <p class="field-inline-help">圖片會直接綁在活動資料裡，建議上傳壓縮後的橫式封面。</p>
           </div>
         </div>
 
         <div class="editor-card">
           <div class="section-header">
-            <div>
-              <p class="section-eyebrow">表單流程</p>
-              <h3>頁面與欄位</h3>
-            </div>
+            <h3>頁面與欄位</h3>
             <button class="secondary-button" type="button" data-admin-action="add-page">新增頁面</button>
           </div>
           <div class="page-list">
@@ -1588,10 +1575,7 @@ function renderAdminEditor() {
 
         <div class="editor-card">
           <div class="section-header">
-            <div>
-              <p class="section-eyebrow">報名紀錄</p>
-              <h3>最近送出的資料</h3>
-            </div>
+            <h3>最近報名</h3>
           </div>
           ${
             draft.submissions.length
@@ -1600,7 +1584,7 @@ function renderAdminEditor() {
                   .slice(0, 8)
                   .map((submission) => renderSubmissionCard(submission))
                   .join("")}</div>`
-              : `<div class="empty-state"><h4>尚未有人報名</h4><p class="muted-text">前台有人送出後，這裡會顯示最近的報名紀錄摘要。</p></div>`
+              : `<div class="empty-state"><h4>尚未有人報名</h4></div>`
           }
         </div>
       </div>
@@ -1656,7 +1640,11 @@ async function loginAdmin(password) {
     state.admin.draft = state.admin.events[0] ? normalizeEvent(state.admin.events[0]) : null;
     state.admin.dirty = false;
     state.admin.usingDefaultPassword = Boolean(payload.usingDefaultPassword);
-    sessionStorage.setItem("event-admin-password", password);
+    state.admin.collapsedPages = {};
+    state.admin.collapsedQuestions = {};
+    try {
+      sessionStorage.setItem("event-admin-password", password);
+    } catch {}
     setStorageSummaryFromAdmin(payload);
     renderPublic();
     renderAdmin();
@@ -1677,8 +1665,12 @@ function logoutAdmin() {
     dirty: false,
     usingDefaultPassword: false,
     loginError: "",
+    collapsedPages: {},
+    collapsedQuestions: {},
   };
-  sessionStorage.removeItem("event-admin-password");
+  try {
+    sessionStorage.removeItem("event-admin-password");
+  } catch {}
   renderAdmin();
 }
 
@@ -1693,6 +1685,15 @@ function markDraftDirty(shouldRender = true) {
   if (shouldRender) {
     renderAdmin();
   }
+}
+
+function toggleAdminCollapsed(collectionName, id) {
+  const current = Boolean(state.admin[collectionName]?.[id]);
+  state.admin[collectionName] = {
+    ...state.admin[collectionName],
+    [id]: !current,
+  };
+  renderAdmin();
 }
 
 function findPage(pageId) {
@@ -1791,6 +1792,8 @@ function selectAdminEvent(eventId) {
   state.admin.selectedEventId = selected?.id || null;
   state.admin.draft = selected ? normalizeEvent(selected) : null;
   state.admin.dirty = false;
+  state.admin.collapsedPages = {};
+  state.admin.collapsedQuestions = {};
   renderAdmin();
 }
 
@@ -1806,7 +1809,76 @@ function createNewAdminEvent() {
   state.admin.selectedEventId = event.id;
   state.admin.draft = event;
   state.admin.dirty = true;
+  state.admin.collapsedPages = {};
+  state.admin.collapsedQuestions = {};
   renderAdmin();
+  showToast("已建立新活動草稿。");
+}
+
+function duplicateEventStructure(sourceEvent) {
+  const source = normalizeEvent(sourceEvent);
+  const pageIdMap = new Map();
+
+  for (const page of source.pages) {
+    pageIdMap.set(page.id, createId("page"));
+  }
+
+  const duplicatedPages = source.pages.map((page) => {
+    return {
+      ...page,
+      id: pageIdMap.get(page.id),
+      defaultNextPageId:
+        page.defaultNextPageId && pageIdMap.has(page.defaultNextPageId)
+          ? pageIdMap.get(page.defaultNextPageId)
+          : page.defaultNextPageId === END_OF_FLOW
+            ? END_OF_FLOW
+            : null,
+      questions: page.questions.map((question) => {
+        return {
+          ...question,
+          id: createId("question"),
+          options: question.options.map((option) => ({
+            ...option,
+            id: createId("option"),
+            nextPageId:
+              option.nextPageId && pageIdMap.has(option.nextPageId)
+                ? pageIdMap.get(option.nextPageId)
+                : option.nextPageId === END_OF_FLOW
+                  ? END_OF_FLOW
+                  : null,
+          })),
+        };
+      }),
+    };
+  });
+
+  const duplicateTitle = source.title.includes("副本") ? source.title : `${source.title} 副本`;
+
+  return normalizeEvent({
+    ...source,
+    id: createId("event"),
+    title: duplicateTitle,
+    status: "draft",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    pages: duplicatedPages,
+    submissions: [],
+  });
+}
+
+function duplicateCurrentAdminEvent() {
+  if (!state.admin.draft) {
+    return;
+  }
+
+  const duplicatedEvent = duplicateEventStructure(state.admin.draft);
+  state.admin.selectedEventId = duplicatedEvent.id;
+  state.admin.draft = duplicatedEvent;
+  state.admin.dirty = true;
+  state.admin.collapsedPages = {};
+  state.admin.collapsedQuestions = {};
+  renderAdmin();
+  showToast("已複製活動副本，可直接改成下一個活動。");
 }
 
 function moveItem(list, fromIndex, direction) {
@@ -2022,20 +2094,58 @@ function restartRegistration() {
   renderPublicDetail();
 }
 
+async function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("圖片讀取失敗"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function optimizeCoverImage(file) {
+  const sourceUrl = await fileToDataUrl(file);
+  const image = await new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("圖片載入失敗"));
+    img.src = sourceUrl;
+  });
+
+  const maxWidth = 1600;
+  const maxHeight = 1600;
+  const widthRatio = maxWidth / image.width;
+  const heightRatio = maxHeight / image.height;
+  const ratio = Math.min(1, widthRatio, heightRatio);
+  const targetWidth = Math.max(1, Math.round(image.width * ratio));
+  const targetHeight = Math.max(1, Math.round(image.height * ratio));
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return sourceUrl;
+  }
+
+  context.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+  const outputType = file.type === "image/png" ? "image/png" : "image/jpeg";
+  return canvas.toDataURL(outputType, outputType === "image/png" ? undefined : 0.88);
+}
+
 async function handleCoverUpload(file) {
   if (!file || !state.admin.draft) {
     return;
   }
 
-  const reader = new FileReader();
-  reader.onload = () => {
-    state.admin.draft.coverImage = String(reader.result || "");
+  try {
+    const optimizedImage = await optimizeCoverImage(file);
+    state.admin.draft.coverImage = optimizedImage;
     markDraftDirty();
-  };
-  reader.onerror = () => {
+  } catch {
     showToast("圖片讀取失敗，請再試一次。");
-  };
-  reader.readAsDataURL(file);
+  }
 }
 
 function shouldRenderAfterControlChange(target) {
@@ -2119,12 +2229,22 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  if (target.closest("[data-close-public='true']")) {
+    closePublicEvent();
+    return;
+  }
+
   const adminAction = target.closest("[data-admin-action]");
   if (adminAction instanceof HTMLElement) {
     const { adminAction: action, eventId, pageId, questionId, optionId } = adminAction.dataset;
 
     if (action === "new-event") {
       createNewAdminEvent();
+      return;
+    }
+
+    if (action === "duplicate-event") {
+      duplicateCurrentAdminEvent();
       return;
     }
 
@@ -2135,6 +2255,16 @@ document.addEventListener("click", async (event) => {
 
     if (action === "save-event") {
       await saveDraft();
+      return;
+    }
+
+    if (action === "toggle-page" && pageId) {
+      toggleAdminCollapsed("collapsedPages", pageId);
+      return;
+    }
+
+    if (action === "toggle-question" && questionId) {
+      toggleAdminCollapsed("collapsedQuestions", questionId);
       return;
     }
 
@@ -2155,13 +2285,22 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "add-page" && state.admin.draft) {
-      state.admin.draft.pages.push(createPage(`新頁面 ${state.admin.draft.pages.length + 1}`));
+      const newPage = createPage(`新頁面 ${state.admin.draft.pages.length + 1}`);
+      state.admin.draft.pages.push(newPage);
+      state.admin.collapsedPages[newPage.id] = false;
       markDraftDirty();
       return;
     }
 
     if (action === "delete-page" && pageId && state.admin.draft) {
+      const pageToDelete = findPage(pageId);
+      if (pageToDelete) {
+        for (const question of pageToDelete.questions) {
+          delete state.admin.collapsedQuestions[question.id];
+        }
+      }
       state.admin.draft.pages = state.admin.draft.pages.filter((page) => page.id !== pageId);
+      delete state.admin.collapsedPages[pageId];
       if (state.admin.draft.pages.length === 0) {
         state.admin.draft.pages.push(createPage("基本資料"));
       }
@@ -2189,7 +2328,9 @@ document.addEventListener("click", async (event) => {
         return;
       }
 
-      page.questions.push(createQuestion(`新欄位 ${page.questions.length + 1}`, "shortText"));
+      const newQuestion = createQuestion(`新欄位 ${page.questions.length + 1}`, "shortText");
+      page.questions.push(newQuestion);
+      state.admin.collapsedQuestions[newQuestion.id] = false;
       markDraftDirty();
       return;
     }
@@ -2201,6 +2342,7 @@ document.addEventListener("click", async (event) => {
       }
 
       page.questions = page.questions.filter((question) => question.id !== questionId);
+      delete state.admin.collapsedQuestions[questionId];
       markDraftDirty();
       return;
     }
@@ -2278,6 +2420,11 @@ document.addEventListener("click", async (event) => {
       restartRegistration();
       return;
     }
+
+    if (action === "close") {
+      closePublicEvent();
+      return;
+    }
   }
 
   const eventAction = target.closest("[data-event-action='open']");
@@ -2334,9 +2481,14 @@ dom.closeAdmin.addEventListener("click", () => {
   closeAdmin();
 });
 
-dom.refreshEvents.addEventListener("click", async () => {
-  await loadPublicEvents();
-  showToast("活動列表已更新。");
+dom.closePublic.addEventListener("click", () => {
+  closePublicEvent();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !dom.publicOverlay.classList.contains("hidden")) {
+    closePublicEvent();
+  }
 });
 
 async function init() {

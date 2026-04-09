@@ -15,45 +15,26 @@
   <body>
     <div class="shell">
       <header class="topbar">
-        <div>
-          <p class="eyebrow">Event Flow Builder</p>
-          <h1>活動報名平台</h1>
-          <p class="subtitle">
-            前台顯示活動與逐頁報名表單，後台可用密碼進入並管理活動、欄位、邏輯與名額。
-          </p>
-        </div>
-        <button id="open-admin" class="ghost-button" type="button">後台管理</button>
+        <h1>活動報名</h1>
+        <button id="open-admin" class="ghost-button" type="button">管理</button>
       </header>
 
-      <main class="main-grid">
-        <section class="hero-panel">
-          <div class="hero-copy">
-            <p class="hero-kicker">單一頁面就能完成</p>
-            <h2>活動建立、條件分流、名額控管一次做好</h2>
-            <p>
-              這個版本支援封面圖片、可編輯欄位、題型切換、逐頁邏輯跳轉，以及以「總報名人數」為基準的容量限制。
-            </p>
-            <div class="hero-metrics" id="hero-metrics"></div>
-          </div>
-          <div class="hero-card" id="storage-indicator"></div>
-        </section>
-
-        <section class="panel public-panel">
-          <div class="section-header">
-            <div>
-              <p class="section-eyebrow">前台</p>
-              <h3>活動列表</h3>
-            </div>
-            <button id="refresh-events" class="text-button" type="button">重新整理</button>
-          </div>
-          <div id="event-list" class="event-list"></div>
-        </section>
-
-        <section class="panel detail-panel" id="public-detail"></section>
+      <main class="public-stage">
+        <section id="event-list" class="event-strip"></section>
       </main>
     </div>
 
     <div id="toast" class="toast" aria-live="polite"></div>
+
+    <div id="public-overlay" class="public-overlay hidden" aria-hidden="true">
+      <div class="public-backdrop" data-close-public="true"></div>
+      <section class="public-modal" aria-label="活動報名表">
+        <button id="close-public" class="icon-button public-close" type="button" aria-label="關閉活動">
+          ×
+        </button>
+        <div id="public-detail"></div>
+      </section>
+    </div>
 
     <div id="admin-overlay" class="admin-overlay hidden" aria-hidden="true">
       <div class="admin-backdrop" data-close-admin="true"></div>

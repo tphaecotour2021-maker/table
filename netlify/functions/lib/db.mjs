@@ -9,6 +9,7 @@ const QUESTION_TYPES = new Set([
   "longText",
   "email",
   "phone",
+  "idNumber",
   "number",
   "singleChoice",
   "multiChoice",
@@ -279,6 +280,12 @@ function normalizeAnswerForQuestion(question, rawAnswer) {
     return Number.isFinite(parsed) ? String(parsed) : "";
   }
 
+  if (question.type === "idNumber") {
+    return rawAnswer == null
+      ? ""
+      : String(rawAnswer).trim().toUpperCase().replace(/[\s-]/g, "");
+  }
+
   return rawAnswer == null ? "" : String(rawAnswer);
 }
 
@@ -347,6 +354,13 @@ function validateQuestionAnswer(question, answer) {
     const phonePattern = /^[0-9+\-()#\s]{6,}$/;
     if (!phonePattern.test(answer)) {
       return `${question.label} 需要是有效的電話格式。`;
+    }
+  }
+
+  if (question.type === "idNumber" && answer) {
+    const idPattern = /^[A-Z][A-Z0-9]\d{8}$/;
+    if (!idPattern.test(String(answer).toUpperCase())) {
+      return `${question.label} 需要填寫 10 碼有效身分證字號。`;
     }
   }
 
@@ -524,6 +538,7 @@ export function getQuestionTypeLabel(type) {
     longText: "長答",
     email: "Email",
     phone: "電話",
+    idNumber: "身分證字號",
     number: "數字",
     singleChoice: "單選",
     multiChoice: "複選",

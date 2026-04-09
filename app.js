@@ -160,6 +160,7 @@ function createQuestion(label = "新欄位", type = "shortText") {
     required: true,
     placeholder: "",
     countsTowardCapacity: false,
+    repeatForAdditionalParticipants: false,
     options: supportsOptions(type) ? [createOption("選項 1"), createOption("選項 2")] : [],
   };
 }
@@ -230,6 +231,7 @@ function normalizeQuestion(question) {
     required: Boolean(question?.required),
     placeholder: String(question?.placeholder || "").trim(),
     countsTowardCapacity: type === "number" ? Boolean(question?.countsTowardCapacity) : false,
+    repeatForAdditionalParticipants: Boolean(question?.repeatForAdditionalParticipants),
     options: supportsOptions(type)
       ? (Array.isArray(question?.options) && question.options.length
           ? question.options
@@ -263,6 +265,17 @@ function normalizeSubmission(submission) {
       ? submission.visitedPageIds.map((value) => String(value))
       : [],
     answers: submission?.answers && typeof submission.answers === "object" ? submission.answers : {},
+    repeatedAnswers: Array.isArray(submission?.repeatedAnswers)
+      ? submission.repeatedAnswers
+          .map((entry, index) => ({
+            participantNumber: Math.max(
+              2,
+              Number.parseInt(entry?.participantNumber, 10) || index + 2,
+            ),
+            answers: entry?.answers && typeof entry.answers === "object" ? entry.answers : {},
+          }))
+          .sort((left, right) => left.participantNumber - right.participantNumber)
+      : [],
   };
 }
 
@@ -320,37 +333,109 @@ function normalizeAnswersForEvent(event, answers) {
 
   for (const page of event.pages) {
     for (const question of page.questions) {
-      const value = source[question.id];
-
-      if (question.type === "multiChoice") {
-        const validIds = new Set(question.options.map((option) => option.id));
-        normalizedAnswers[question.id] = Array.isArray(value)
-          ? value.filter((entry) => validIds.has(entry))
-          : [];
-        continue;
-      }
-
-      if (supportsOptions(question.type)) {
-        const validIds = new Set(question.options.map((option) => option.id));
-        normalizedAnswers[question.id] = validIds.has(value) ? value : "";
-        continue;
-      }
-
-      if (question.type === "number") {
-        if (value === "" || value == null) {
-          normalizedAnswers[question.id] = "";
-        } else {
-          const parsed = Number.parseInt(value, 10);
-          normalizedAnswers[question.id] = Number.isFinite(parsed) ? String(parsed) : "";
-        }
-        continue;
-      }
-
-      normalizedAnswers[question.id] = value == null ? "" : String(value);
+      normalizedAnswers[question.id] = normalizeAnswerForQuestion(question, source[question.id]);
     }
   }
 
   return normalizedAnswers;
+}
+
+function normalizeAnswerForQuestion(question, value) {
+  if (question.type === "multiChoice") {
+    const validIds = new Set(question.options.map((option) => option.id));
+    return Array.isArray(value) ? value.filter((entry) => validIds.has(entry)) : [];
+  }
+
+  if (supportsOptions(question.type)) {
+    const validIds = new Set(question.options.map((option) => option.id));
+    return validIds.has(value) ? value : "";
+  }
+
+  if (question.type === "number") {
+    if (value === "" || value == null) {
+      return "";
+    }
+
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? String(parsed) : "";
+  }
+
+  return value == null ? "" : String(value);
+}
+
+function getRepeatQuestions(event) {
+  return event.pages
+    .flatMap((page) => page.questions)
+    .filter((question) => question.repeatForAdditionalParticipants);
+}
+
+function normalizeRepeatedAnswersForEvent(event, repeatedAnswers) {
+  const repeatQuestions = getRepeatQuestions(event);
+  const source = Array.isArray(repeatedAnswers) ? repeatedAnswers : [];
+  const normalized = new Map();
+
+  for (const [index, entry] of source.entries()) {
+    const participantNumber = Math.max(
+      2,
+      Number.parseInt(entry?.participantNumber, 10) || index + 2,
+    );
+    const answers = entry?.answers && typeof entry.answers === "object" ? entry.answers : {};
+    const normalizedAnswers = {};
+
+    for (const question of repeatQuestions) {
+      normalizedAnswers[question.id] = normalizeAnswerForQuestion(question, answers[question.id]);
+    }
+
+    normalized.set(participantNumber, {
+      participantNumber,
+      answers: normalizedAnswers,
+    });
+  }
+
+  return [...normalized.values()].sort(
+    (left, right) => left.participantNumber - right.participantNumber,
+  );
+}
+
+function getRepeatAnswerEntry(runner, participantNumber) {
+  return (
+    runner?.repeatedAnswers?.find((entry) => entry.participantNumber === participantNumber) || null
+  );
+}
+
+function ensureRepeatAnswerEntry(event, runner, participantNumber) {
+  if (!runner) {
+    return null;
+  }
+
+  const existing = getRepeatAnswerEntry(runner, participantNumber);
+  if (existing) {
+    return existing;
+  }
+
+  runner.repeatedAnswers = normalizeRepeatedAnswersForEvent(event, [
+    ...(runner.repeatedAnswers || []),
+    {
+      participantNumber,
+      answers: {},
+    },
+  ]);
+
+  return getRepeatAnswerEntry(runner, participantNumber);
+}
+
+function validateRepeatAnswers(event, answers) {
+  const errors = {};
+  const source = answers && typeof answers === "object" ? answers : {};
+
+  for (const question of getRepeatQuestions(event)) {
+    const message = validateQuestion(question, normalizeAnswerForQuestion(question, source[question.id]));
+    if (message) {
+      errors[question.id] = message;
+    }
+  }
+
+  return errors;
 }
 
 function resolveNextPageId(event, currentPageId, answers) {
@@ -613,12 +698,13 @@ const api = {
     });
   },
 
-  async submitRegistration(eventId, answers) {
+  async submitRegistration(eventId, answers, repeatedAnswers = []) {
     return requestRemote("register", {
       method: "POST",
       body: JSON.stringify({
         eventId,
         answers,
+        repeatedAnswers,
       }),
     });
   },
@@ -662,6 +748,11 @@ function ensureRunnerForEvent(eventId) {
     history: event.pages[0] ? [event.pages[0].id] : [],
     answers: {},
     errors: {},
+    stage: "flow",
+    repeatedAnswers: [],
+    repeatErrors: {},
+    repeatParticipantNumber: 2,
+    finalParticipantCount: 1,
     submitting: false,
     submitted: false,
     success: null,
@@ -878,6 +969,7 @@ function renderPublicDetail() {
 
   ensureRunnerForEvent(event.id);
   const runner = state.public.runner;
+  const repeatQuestions = getRepeatQuestions(event);
 
   if (runner?.submitted) {
     dom.publicDetail.innerHTML = `
@@ -908,6 +1000,81 @@ function renderPublicDetail() {
     return;
   }
 
+  const isFull = event.remainingCapacity === 0;
+
+  if (runner?.stage === "repeat") {
+    const totalParticipants = Math.max(2, runner.finalParticipantCount || 2);
+    const currentEntry = ensureRepeatAnswerEntry(event, runner, runner.repeatParticipantNumber);
+    const repeatProgress =
+      totalParticipants <= 1
+        ? 100
+        : ((runner.repeatParticipantNumber - 1) / (totalParticipants - 1)) * 100;
+    const isFinalRepeatParticipant = runner.repeatParticipantNumber >= totalParticipants;
+
+    dom.publicDetail.innerHTML = `
+      <div class="registration-shell">
+        <div class="registration-cover">
+          ${event.coverImage ? `<img data-image-role="public-detail" data-event-id="${event.id}" alt="${escapeHtml(event.title)} 封面" />` : ""}
+        </div>
+        <div class="chip-row">
+          <span class="status-pill ${isFull ? "full" : "live"}">${isFull ? "名額已滿" : "開放報名"}</span>
+          ${
+            event.remainingCapacity == null
+              ? ""
+              : `<span class="meta-pill">剩餘 ${event.remainingCapacity} 人</span>`
+          }
+        </div>
+        <h3 style="margin-top: 14px;">${escapeHtml(event.title)}</h3>
+        <div class="progress-track">
+          <div class="progress-bar" style="width: ${repeatProgress}%"></div>
+        </div>
+        <div class="meta-row">
+          <span class="meta-pill">同行資料</span>
+          <span class="meta-pill">第 ${runner.repeatParticipantNumber} 位 / 共 ${totalParticipants} 位</span>
+        </div>
+        ${
+          isFull
+            ? `<div class="empty-state" style="margin-top: 20px;"><h3>這個活動目前已額滿</h3></div>`
+            : `
+              ${repeatQuestions
+                .map((question) => {
+                  const value = currentEntry?.answers?.[question.id];
+                  const error = runner.repeatErrors?.[question.id];
+                  return `
+                    <div class="question-block">
+                      <div class="question-label">
+                        <span>${escapeHtml(question.label)}</span>
+                        ${question.required ? `<span class="required-badge">*</span>` : ""}
+                      </div>
+                      ${question.helpText ? `<p class="field-help">${nl2br(question.helpText)}</p>` : ""}
+                      <div style="margin-top: 12px;">
+                        ${renderInputField(question, value, error)}
+                      </div>
+                    </div>
+                  `;
+                })
+                .join("")}
+              <div class="action-row" style="margin-top: 24px;">
+                <button class="secondary-button" type="button" data-public-action="prev">上一位</button>
+                <button class="primary-button" type="button" data-public-action="submit" ${runner.submitting ? "disabled" : ""}>
+                  ${
+                    runner.submitting
+                      ? "送出中..."
+                      : isFinalRepeatParticipant
+                        ? "送出報名"
+                        : "下一位同行"
+                  }
+                </button>
+                <button class="text-button" type="button" data-public-action="restart">重新開始</button>
+                <button class="text-button" type="button" data-public-action="close">關閉</button>
+              </div>
+            `
+        }
+      </div>
+    `;
+    return;
+  }
+
   const currentPageIndex = Math.max(
     0,
     event.pages.findIndex((page) => page.id === runner.currentPageId),
@@ -917,7 +1084,10 @@ function renderPublicDetail() {
     ? ((currentPageIndex + 1) / event.pages.length) * 100
     : 0;
   const isFinalPage = !resolveNextPageId(event, currentPage.id, normalizeAnswersForEvent(event, runner.answers));
-  const isFull = event.remainingCapacity === 0;
+  const needsRepeatedQuestions =
+    isFinalPage &&
+    computeParticipantsFromAnswers(event, runner.answers) > 1 &&
+    repeatQuestions.length > 0;
 
   dom.publicDetail.innerHTML = `
     <div class="registration-shell">
@@ -979,7 +1149,9 @@ function renderPublicDetail() {
                   runner.submitting
                     ? "送出中..."
                     : isFinalPage
-                      ? "送出報名"
+                      ? needsRepeatedQuestions
+                        ? "下一位同行"
+                        : "送出報名"
                       : "下一頁"
                 }
               </button>
@@ -1126,6 +1298,7 @@ function renderQuestionEditor(event, page, question, questionIndex) {
             <span class="meta-pill">${escapeHtml(getQuestionTypeLabel(question.type))}</span>
             ${question.required ? `<span class="meta-pill">必填</span>` : ""}
             ${question.countsTowardCapacity ? `<span class="meta-pill">計入人數</span>` : ""}
+            ${question.repeatForAdditionalParticipants ? `<span class="meta-pill">多人重問</span>` : ""}
           </div>
         </div>
         <div class="action-row">
@@ -1173,6 +1346,10 @@ function renderQuestionEditor(event, page, question, questionIndex) {
         <label class="inline-checkbox">
           <input type="checkbox" data-question-id="${question.id}" data-question-field="required" ${question.required ? "checked" : ""} />
           <span>必填</span>
+        </label>
+        <label class="inline-checkbox">
+          <input type="checkbox" data-question-id="${question.id}" data-question-field="repeatForAdditionalParticipants" ${question.repeatForAdditionalParticipants ? "checked" : ""} />
+          <span>多人報名時，對每位同行都再問這題</span>
         </label>
         ${
           question.type === "number"
@@ -1280,6 +1457,10 @@ function renderPageEditor(event, page, pageIndex) {
 function getSubmissionColumns(event) {
   const questions = [];
   const labelCount = new Map();
+  const highestParticipantCount = Math.max(
+    1,
+    ...(event.submissions || []).map((submission) => submission.totalParticipants || 1),
+  );
 
   for (const page of event.pages) {
     for (const question of page.questions) {
@@ -1292,7 +1473,7 @@ function getSubmissionColumns(event) {
     }
   }
 
-  return questions.map((entry) => {
+  const baseColumns = questions.map((entry) => {
     const label = entry.question.label || "未命名欄位";
     return {
       ...entry,
@@ -1302,6 +1483,29 @@ function getSubmissionColumns(event) {
           : label,
     };
   });
+
+  const repeatedQuestionIds = new Set(
+    (event.submissions || []).flatMap((submission) =>
+      (submission.repeatedAnswers || []).flatMap((entry) => Object.keys(entry.answers || {})),
+    ),
+  );
+  const repeatedBaseColumns = baseColumns.filter(
+    (entry) =>
+      entry.question.repeatForAdditionalParticipants || repeatedQuestionIds.has(entry.question.id),
+  );
+  const repeatedColumns = [];
+
+  for (let participantNumber = 2; participantNumber <= highestParticipantCount; participantNumber += 1) {
+    for (const entry of repeatedBaseColumns) {
+      repeatedColumns.push({
+        ...entry,
+        participantNumber,
+        header: `第 ${participantNumber} 位 / ${entry.header}`,
+      });
+    }
+  }
+
+  return [...baseColumns, ...repeatedColumns];
 }
 
 function formatSubmissionAnswer(question, answer) {
@@ -1345,9 +1549,19 @@ function getSubmissionRows(event) {
         submittedAt: formatDate(submission.submittedAt),
         totalParticipants: submission.totalParticipants,
         visitedPages,
-        answers: columns.map((column) =>
-          formatSubmissionAnswer(column.question, submission.answers?.[column.question.id]),
-        ),
+        answers: columns.map((column) => {
+          if (column.participantNumber) {
+            const repeatedEntry = (submission.repeatedAnswers || []).find(
+              (entry) => entry.participantNumber === column.participantNumber,
+            );
+            return formatSubmissionAnswer(
+              column.question,
+              repeatedEntry?.answers?.[column.question.id],
+            );
+          }
+
+          return formatSubmissionAnswer(column.question, submission.answers?.[column.question.id]);
+        }),
       };
     });
 
@@ -1926,7 +2140,11 @@ function updateDraftQuestionField(questionId, field, value, checked, shouldRende
     return;
   }
 
-  if (field === "required" || field === "countsTowardCapacity") {
+  if (
+    field === "required" ||
+    field === "countsTowardCapacity" ||
+    field === "repeatForAdditionalParticipants"
+  ) {
     question[field] = checked;
   } else if (field === "type") {
     question.type = value;
@@ -1972,32 +2190,64 @@ function updateRunnerAnswer(questionId, value, checked, shouldRender = false) {
     return;
   }
 
+  const targetAnswers =
+    runner.stage === "repeat"
+      ? ensureRepeatAnswerEntry(event, runner, runner.repeatParticipantNumber)?.answers
+      : runner.answers;
+
+  if (!targetAnswers) {
+    return;
+  }
+
   if (question.type === "multiChoice") {
-    const current = Array.isArray(runner.answers[questionId]) ? [...runner.answers[questionId]] : [];
+    const current = Array.isArray(targetAnswers[questionId]) ? [...targetAnswers[questionId]] : [];
     if (checked && !current.includes(value)) {
       current.push(value);
     }
     if (!checked) {
-      runner.answers[questionId] = current.filter((entry) => entry !== value);
+      targetAnswers[questionId] = current.filter((entry) => entry !== value);
     } else {
-      runner.answers[questionId] = current;
+      targetAnswers[questionId] = current;
     }
   } else {
-    runner.answers[questionId] = value;
+    targetAnswers[questionId] = value;
   }
 
-  runner.errors = {
-    ...runner.errors,
-    [questionId]: "",
-  };
+  if (runner.stage === "repeat") {
+    runner.repeatErrors = {
+      ...runner.repeatErrors,
+      [questionId]: "",
+    };
+  } else {
+    runner.errors = {
+      ...runner.errors,
+      [questionId]: "",
+    };
+  }
   if (shouldRender) {
     renderPublicDetail();
   }
 }
 
 function goToPreviousPage() {
+  const event = getSelectedPublicEvent();
   const runner = state.public.runner;
-  if (!runner || runner.history.length < 2) {
+  if (!runner) {
+    return;
+  }
+
+  if (runner.stage === "repeat") {
+    if (runner.repeatParticipantNumber > 2) {
+      runner.repeatParticipantNumber -= 1;
+    } else {
+      runner.stage = "flow";
+    }
+    runner.repeatErrors = {};
+    renderPublicDetail();
+    return;
+  }
+
+  if (!event || runner.history.length < 2) {
     return;
   }
 
@@ -2044,18 +2294,61 @@ async function submitRegistration() {
     return;
   }
 
-  const errors = validateCurrentPage(event, runner.currentPageId, runner.answers);
-  if (Object.keys(errors).length) {
-    runner.errors = errors;
-    renderPublicDetail();
-    return;
+  if (runner.stage === "repeat") {
+    const currentEntry = ensureRepeatAnswerEntry(event, runner, runner.repeatParticipantNumber);
+    const currentAnswers = normalizeRepeatedAnswersForEvent(event, [currentEntry || {}])[0]?.answers || {};
+    const repeatErrors = validateRepeatAnswers(event, currentAnswers);
+
+    if (Object.keys(repeatErrors).length) {
+      runner.repeatErrors = repeatErrors;
+      renderPublicDetail();
+      return;
+    }
+
+    if (currentEntry) {
+      currentEntry.answers = currentAnswers;
+    }
+
+    if (runner.repeatParticipantNumber < runner.finalParticipantCount) {
+      runner.repeatParticipantNumber += 1;
+      runner.repeatErrors = {};
+      ensureRepeatAnswerEntry(event, runner, runner.repeatParticipantNumber);
+      renderPublicDetail();
+      return;
+    }
+  } else {
+    const errors = validateCurrentPage(event, runner.currentPageId, runner.answers);
+    if (Object.keys(errors).length) {
+      runner.errors = errors;
+      renderPublicDetail();
+      return;
+    }
+
+    const totalParticipants = computeParticipantsFromAnswers(event, runner.answers);
+    const repeatQuestions = getRepeatQuestions(event);
+
+    if (totalParticipants > 1 && repeatQuestions.length > 0) {
+      runner.stage = "repeat";
+      runner.finalParticipantCount = totalParticipants;
+      runner.repeatParticipantNumber = 2;
+      runner.repeatErrors = {};
+      ensureRepeatAnswerEntry(event, runner, runner.repeatParticipantNumber);
+      renderPublicDetail();
+      return;
+    }
   }
 
   runner.submitting = true;
   renderPublicDetail();
 
   try {
-    const payload = await api.submitRegistration(event.id, runner.answers);
+    const payload = await api.submitRegistration(
+      event.id,
+      runner.answers,
+      normalizeRepeatedAnswersForEvent(event, runner.repeatedAnswers).filter(
+        (entry) => entry.participantNumber <= Math.max(1, runner.finalParticipantCount || 1),
+      ),
+    );
     runner.submitted = true;
     runner.success = {
       totalParticipants: payload.totalParticipants,
@@ -2090,6 +2383,11 @@ function restartRegistration() {
     history: event.pages[0] ? [event.pages[0].id] : [],
     answers: {},
     errors: {},
+    stage: "flow",
+    repeatedAnswers: [],
+    repeatErrors: {},
+    repeatParticipantNumber: 2,
+    finalParticipantCount: 1,
     submitting: false,
     submitted: false,
     success: null,

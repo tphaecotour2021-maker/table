@@ -777,6 +777,47 @@ button:disabled {
   padding: 10px 12px;
 }
 
+.submission-table-wrap {
+  overflow: auto;
+  border: 1px solid rgba(90, 58, 38, 0.12);
+  border-radius: 16px;
+  background: #fffdf9;
+}
+
+.submission-table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.submission-table th,
+.submission-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(90, 58, 38, 0.1);
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+  line-height: 1.55;
+}
+
+.submission-table th {
+  position: sticky;
+  top: 0;
+  background: #f8f0e6;
+  color: var(--text);
+  font-weight: 700;
+  z-index: 1;
+}
+
+.submission-table tbody tr:nth-child(even) {
+  background: rgba(255, 248, 241, 0.55);
+}
+
+.submission-table tbody tr:hover {
+  background: rgba(181, 72, 47, 0.05);
+}
+
 .compact-row {
   margin-top: 8px;
 }

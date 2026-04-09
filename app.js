@@ -1,9 +1,5 @@
 const END_OF_FLOW = "__end__";
 const API_BASE = "/.netlify/functions";
-const LOCAL_DB_KEY = "event-registration-browser-db";
-const LOCAL_PASSWORD_KEY = "event-registration-browser-password";
-const DEFAULT_ADMIN_PASSWORD = "admin1234";
-let inMemoryDatabase = { events: [] };
 
 const QUESTION_TYPE_OPTIONS = [
   { value: "shortText", label: "簡答" },
@@ -21,11 +17,7 @@ const OPTION_TYPES = new Set(["singleChoice", "multiChoice", "dropdown"]);
 const BRANCHING_TYPES = new Set(["singleChoice", "multiChoice", "dropdown"]);
 
 function readSessionPassword() {
-  try {
-    return sessionStorage.getItem("event-admin-password") || "";
-  } catch {
-    return "";
-  }
+  return "";
 }
 
 const state = {
@@ -35,6 +27,7 @@ const state = {
     selectedEventId: null,
     runner: null,
     loading: true,
+    error: "",
   },
   admin: {
     open: false,
@@ -295,49 +288,6 @@ function normalizeEvent(event) {
   };
 }
 
-function readLocalDatabase() {
-  try {
-    const raw = localStorage.getItem(LOCAL_DB_KEY);
-    if (!raw) {
-      return {
-        events: inMemoryDatabase.events.map((event) => normalizeEvent(event)),
-      };
-    }
-
-    const parsed = JSON.parse(raw);
-    const events = Array.isArray(parsed?.events) ? parsed.events.map((event) => normalizeEvent(event)) : [];
-    inMemoryDatabase = { events: events.map((event) => normalizeEvent(event)) };
-    return { events };
-  } catch {
-    return {
-      events: inMemoryDatabase.events.map((event) => normalizeEvent(event)),
-    };
-  }
-}
-
-function writeLocalDatabase(database) {
-  const normalized = {
-    events: database.events.map((event) => normalizeEvent(event)),
-  };
-  inMemoryDatabase = {
-    events: normalized.events.map((event) => normalizeEvent(event)),
-  };
-  try {
-    localStorage.setItem(LOCAL_DB_KEY, JSON.stringify(normalized));
-  } catch {
-    return inMemoryDatabase;
-  }
-  return normalized;
-}
-
-function getLocalAdminPassword() {
-  try {
-    return localStorage.getItem(LOCAL_PASSWORD_KEY) || DEFAULT_ADMIN_PASSWORD;
-  } catch {
-    return DEFAULT_ADMIN_PASSWORD;
-  }
-}
-
 function sanitizeEventForPublic(event) {
   const normalized = normalizeEvent(event);
   return {
@@ -573,120 +523,6 @@ function cleanFlowReferences(event) {
   }
 }
 
-const localApi = {
-  async getPublicEvents() {
-    const database = readLocalDatabase();
-    return {
-      ok: true,
-      events: database.events
-        .filter((event) => event.status === "published")
-        .map((event) => sanitizeEventForPublic(event)),
-    };
-  },
-
-  async adminLogin(password) {
-    if (password !== getLocalAdminPassword()) {
-      throw new Error("密碼錯誤，請重新輸入。");
-    }
-
-    const database = readLocalDatabase();
-    return {
-      ok: true,
-      storageMode: "browser-local-storage",
-      usingDefaultPassword: getLocalAdminPassword() === DEFAULT_ADMIN_PASSWORD,
-      events: database.events.map((event) => sanitizeEventForAdmin(event)),
-    };
-  },
-
-  async adminSave(password, event) {
-    if (password !== getLocalAdminPassword()) {
-      throw new Error("密碼錯誤，請重新登入。");
-    }
-
-    const database = readLocalDatabase();
-    const nextEvent = normalizeEvent({
-      ...event,
-      updatedAt: new Date().toISOString(),
-    });
-    cleanFlowReferences(nextEvent);
-
-    const nextEvents = database.events.filter((entry) => entry.id !== nextEvent.id);
-    nextEvents.push(nextEvent);
-    nextEvents.sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
-    writeLocalDatabase({ events: nextEvents });
-
-    return {
-      ok: true,
-      storageMode: "browser-local-storage",
-      usingDefaultPassword: getLocalAdminPassword() === DEFAULT_ADMIN_PASSWORD,
-      events: nextEvents.map((entry) => sanitizeEventForAdmin(entry)),
-      event: sanitizeEventForAdmin(nextEvent),
-    };
-  },
-
-  async adminDelete(password, eventId) {
-    if (password !== getLocalAdminPassword()) {
-      throw new Error("密碼錯誤，請重新登入。");
-    }
-
-    const database = readLocalDatabase();
-    const nextEvents = database.events.filter((event) => event.id !== eventId);
-    writeLocalDatabase({ events: nextEvents });
-
-    return {
-      ok: true,
-      storageMode: "browser-local-storage",
-      usingDefaultPassword: getLocalAdminPassword() === DEFAULT_ADMIN_PASSWORD,
-      events: nextEvents.map((event) => sanitizeEventForAdmin(event)),
-    };
-  },
-
-  async submitRegistration(eventId, answers) {
-    const database = readLocalDatabase();
-    const event = database.events.find((entry) => entry.id === eventId && entry.status === "published");
-
-    if (!event) {
-      throw new Error("找不到可報名的活動。");
-    }
-
-    const validation = validateWholeFlow(event, answers);
-    if (!validation.ok) {
-      const firstError = validation.errors[0];
-      const error = new Error(firstError?.message || "表單資料不完整。");
-      error.validation = validation.errors;
-      throw error;
-    }
-
-    const totalParticipants = computeParticipantsFromAnswers(event, validation.answers);
-    const remainingCapacity = computeRemainingCapacity(event);
-
-    if (remainingCapacity != null && totalParticipants > remainingCapacity) {
-      throw new Error(`剩餘名額不足，目前只剩 ${remainingCapacity} 人。`);
-    }
-
-    event.submissions.push({
-      id: createId("submission"),
-      submittedAt: new Date().toISOString(),
-      totalParticipants,
-      visitedPageIds: validation.visitedPageIds,
-      answers: validation.answers,
-    });
-    event.updatedAt = new Date().toISOString();
-    writeLocalDatabase(database);
-
-    return {
-      ok: true,
-      totalParticipants,
-      summary: {
-        totalForms: event.submissions.length,
-        totalParticipants: computeUsedCapacity(event),
-        remainingCapacity: computeRemainingCapacity(event),
-      },
-      event: sanitizeEventForPublic(event),
-    };
-  },
-};
-
 async function detectApiMode() {
   try {
     const response = await fetch(`${API_BASE}/events`, { cache: "no-store" });
@@ -701,10 +537,10 @@ async function detectApiMode() {
     };
     return;
   } catch {
-    state.apiMode = "local";
+    state.apiMode = "unavailable";
     state.storageSummary = {
-      modeLabel: "瀏覽器本機模式",
-      detail: "目前沒有讀到 Netlify Functions，改用本機瀏覽器儲存做示範。其他裝置不會看到這些資料。",
+      modeLabel: "伺服端未連線",
+      detail: "目前無法連到 Netlify Functions 與伺服端儲存，網站不會退回本機模式。",
     };
   }
 }
@@ -718,10 +554,23 @@ async function requestRemote(path, options) {
     },
   });
 
-  const payload = await response.json().catch(() => ({}));
+  const raw = await response.text();
+  let payload = {};
+
+  if (raw) {
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = { error: raw };
+    }
+  }
 
   if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || "遠端 API 發生錯誤。");
+    if (response.status === 413) {
+      throw new Error("儲存失敗：上傳內容太大，通常是封面圖片太大。請換小一點的圖片再試一次。");
+    }
+
+    throw new Error(payload.error || `遠端 API 發生錯誤（${response.status}）。`);
   }
 
   return payload;
@@ -729,69 +578,49 @@ async function requestRemote(path, options) {
 
 const api = {
   async getPublicEvents() {
-    if (state.apiMode === "remote") {
-      return requestRemote("events", { method: "GET", headers: {} });
-    }
-
-    return localApi.getPublicEvents();
+    return requestRemote("events", { method: "GET", headers: {} });
   },
 
   async adminLogin(password) {
-    if (state.apiMode === "remote") {
-      return requestRemote("admin", {
-        method: "POST",
-        body: JSON.stringify({
-          action: "login",
-          password,
-        }),
-      });
-    }
-
-    return localApi.adminLogin(password);
+    return requestRemote("admin", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "login",
+        password,
+      }),
+    });
   },
 
   async adminSave(password, event) {
-    if (state.apiMode === "remote") {
-      return requestRemote("admin", {
-        method: "POST",
-        body: JSON.stringify({
-          action: "save",
-          password,
-          event,
-        }),
-      });
-    }
-
-    return localApi.adminSave(password, event);
+    return requestRemote("admin", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "save",
+        password,
+        event,
+      }),
+    });
   },
 
   async adminDelete(password, eventId) {
-    if (state.apiMode === "remote") {
-      return requestRemote("admin", {
-        method: "POST",
-        body: JSON.stringify({
-          action: "delete",
-          password,
-          eventId,
-        }),
-      });
-    }
-
-    return localApi.adminDelete(password, eventId);
+    return requestRemote("admin", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "delete",
+        password,
+        eventId,
+      }),
+    });
   },
 
   async submitRegistration(eventId, answers) {
-    if (state.apiMode === "remote") {
-      return requestRemote("register", {
-        method: "POST",
-        body: JSON.stringify({
-          eventId,
-          answers,
-        }),
-      });
-    }
-
-    return localApi.submitRegistration(eventId, answers);
+    return requestRemote("register", {
+      method: "POST",
+      body: JSON.stringify({
+        eventId,
+        answers,
+      }),
+    });
   },
 };
 
@@ -801,15 +630,10 @@ function setStorageSummaryFromAdmin(payload) {
       modeLabel: "Netlify Blobs",
       detail: "活動資料與報名資料儲存在 Netlify 的伺服端儲存空間。",
     };
-  } else if (payload.storageMode === "local-file") {
+  } else {
     state.storageSummary = {
-      modeLabel: "本機檔案儲存",
-      detail: "目前透過本機開發環境的 JSON 檔案儲存資料，部署到 Netlify 後可改用 Blobs。",
-    };
-  } else if (payload.storageMode === "browser-local-storage") {
-    state.storageSummary = {
-      modeLabel: "瀏覽器本機模式",
-      detail: "資料存在目前這個瀏覽器，適合先做流程示範與版型確認。",
+      modeLabel: "伺服端未就緒",
+      detail: "目前沒有讀到可用的伺服端儲存。",
     };
   }
 }
@@ -862,6 +686,7 @@ function closePublicEvent() {
 
 async function loadPublicEvents({ preserveSelection = true } = {}) {
   state.public.loading = true;
+  state.public.error = "";
   renderPublic();
 
   try {
@@ -885,7 +710,11 @@ async function loadPublicEvents({ preserveSelection = true } = {}) {
       ensureRunnerForEvent(state.public.selectedEventId);
     }
   } catch (error) {
-    showToast(error.message || "活動載入失敗。");
+    state.public.events = [];
+    state.public.selectedEventId = null;
+    state.public.runner = null;
+    state.public.error = error.message || "活動載入失敗。";
+    showToast(state.public.error);
   } finally {
     state.public.loading = false;
     renderPublic();
@@ -897,6 +726,16 @@ function renderEventList() {
     dom.eventList.innerHTML = `
       <div class="empty-state">
         <h3>載入中</h3>
+      </div>
+    `;
+    return;
+  }
+
+  if (state.public.error) {
+    dom.eventList.innerHTML = `
+      <div class="empty-state">
+        <h3>目前無法載入活動</h3>
+        <p class="muted-text" style="margin-top: 8px;">${escapeHtml(state.public.error)}</p>
       </div>
     `;
     return;
@@ -1438,16 +1277,185 @@ function renderPageEditor(event, page, pageIndex) {
   `;
 }
 
-function renderSubmissionCard(submission) {
+function getSubmissionColumns(event) {
+  const questions = [];
+  const labelCount = new Map();
+
+  for (const page of event.pages) {
+    for (const question of page.questions) {
+      const label = question.label || "未命名欄位";
+      labelCount.set(label, (labelCount.get(label) || 0) + 1);
+      questions.push({
+        pageTitle: page.title || "未命名頁面",
+        question,
+      });
+    }
+  }
+
+  return questions.map((entry) => {
+    const label = entry.question.label || "未命名欄位";
+    return {
+      ...entry,
+      header:
+        (labelCount.get(label) || 0) > 1
+          ? `${entry.pageTitle} / ${label}`
+          : label,
+    };
+  });
+}
+
+function formatSubmissionAnswer(question, answer) {
+  if (question.type === "multiChoice") {
+    if (!Array.isArray(answer) || answer.length === 0) {
+      return "";
+    }
+
+    const labels = answer
+      .map((value) => question.options.find((option) => option.id === value)?.label || value)
+      .filter(Boolean);
+    return labels.join("、");
+  }
+
+  if (supportsOptions(question.type)) {
+    if (!answer) {
+      return "";
+    }
+
+    return question.options.find((option) => option.id === answer)?.label || String(answer);
+  }
+
+  if (answer == null) {
+    return "";
+  }
+
+  return String(answer);
+}
+
+function getSubmissionRows(event) {
+  const columns = getSubmissionColumns(event);
+  const rows = [...(event.submissions || [])]
+    .sort((left, right) => String(right.submittedAt).localeCompare(String(left.submittedAt)))
+    .map((submission, index) => {
+      const visitedPages = (submission.visitedPageIds || [])
+        .map((pageId) => event.pages.find((page) => page.id === pageId)?.title || "未命名頁面")
+        .join(" -> ");
+
+      return {
+        index: index + 1,
+        submittedAt: formatDate(submission.submittedAt),
+        totalParticipants: submission.totalParticipants,
+        visitedPages,
+        answers: columns.map((column) =>
+          formatSubmissionAnswer(column.question, submission.answers?.[column.question.id]),
+        ),
+      };
+    });
+
+  return { columns, rows };
+}
+
+function renderSubmissionTable(event) {
+  const { columns, rows } = getSubmissionRows(event);
+
   return `
-    <div class="submission-row">
-      <div class="submission-summary">
-        <span class="meta-pill">${formatDate(submission.submittedAt)}</span>
-        <span class="meta-pill">${submission.totalParticipants} 人</span>
-        <span class="meta-pill">${submission.visitedPageIds?.length || 0} 頁流程</span>
-      </div>
+    <div class="submission-table-wrap">
+      <table class="submission-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>送出時間</th>
+            <th>報名人數</th>
+            <th>經過頁面</th>
+            ${columns.map((column) => `<th>${escapeHtml(column.header)}</th>`).join("")}
+          </tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map(
+              (row) => `
+                <tr>
+                  <td>${row.index}</td>
+                  <td>${escapeHtml(row.submittedAt)}</td>
+                  <td>${row.totalParticipants}</td>
+                  <td>${escapeHtml(row.visitedPages || "-")}</td>
+                  ${row.answers
+                    .map((answer) => `<td>${nl2br(answer || "-")}</td>`)
+                    .join("")}
+                </tr>
+              `,
+            )
+            .join("")}
+        </tbody>
+      </table>
     </div>
   `;
+}
+
+function sanitizeFilename(value) {
+  return String(value || "活動")
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .trim() || "活動";
+}
+
+function exportSubmissionsToExcel() {
+  const event = state.admin.draft;
+  if (!event || !event.submissions?.length) {
+    showToast("目前沒有可匯出的報名資料。");
+    return;
+  }
+
+  const { columns, rows } = getSubmissionRows(event);
+  const html = `
+    <!DOCTYPE html>
+    <html lang="zh-Hant">
+      <head>
+        <meta charset="UTF-8" />
+      </head>
+      <body>
+        <table border="1">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>送出時間</th>
+              <th>報名人數</th>
+              <th>經過頁面</th>
+              ${columns.map((column) => `<th>${escapeHtml(column.header)}</th>`).join("")}
+            </tr>
+          </thead>
+          <tbody>
+            ${rows
+              .map(
+                (row) => `
+                  <tr>
+                    <td>${row.index}</td>
+                    <td>${escapeHtml(row.submittedAt)}</td>
+                    <td>${row.totalParticipants}</td>
+                    <td>${escapeHtml(row.visitedPages || "-")}</td>
+                    ${row.answers
+                      .map((answer) => `<td>${nl2br(answer || "-")}</td>`)
+                      .join("")}
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </body>
+    </html>
+  `;
+
+  const blob = new Blob([`\ufeff${html}`], {
+    type: "application/vnd.ms-excel;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${sanitizeFilename(event.title)}-報名資料.xls`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showToast("報名資料已匯出。");
 }
 
 function renderAdminEditor() {
@@ -1575,15 +1583,16 @@ function renderAdminEditor() {
 
         <div class="editor-card">
           <div class="section-header">
-            <h3>最近報名</h3>
+            <h3>報名資料</h3>
+            ${
+              draft.submissions.length
+                ? `<button class="secondary-button" type="button" data-admin-action="export-submissions">匯出 Excel</button>`
+                : ""
+            }
           </div>
           ${
             draft.submissions.length
-              ? `<div class="submissions-list">${[...draft.submissions]
-                  .sort((left, right) => String(right.submittedAt).localeCompare(String(left.submittedAt)))
-                  .slice(0, 8)
-                  .map((submission) => renderSubmissionCard(submission))
-                  .join("")}</div>`
+              ? renderSubmissionTable(draft)
               : `<div class="empty-state"><h4>尚未有人報名</h4></div>`
           }
         </div>
@@ -1642,9 +1651,6 @@ async function loginAdmin(password) {
     state.admin.usingDefaultPassword = Boolean(payload.usingDefaultPassword);
     state.admin.collapsedPages = {};
     state.admin.collapsedQuestions = {};
-    try {
-      sessionStorage.setItem("event-admin-password", password);
-    } catch {}
     setStorageSummaryFromAdmin(payload);
     renderPublic();
     renderAdmin();
@@ -1668,9 +1674,6 @@ function logoutAdmin() {
     collapsedPages: {},
     collapsedQuestions: {},
   };
-  try {
-    sessionStorage.removeItem("event-admin-password");
-  } catch {}
   renderAdmin();
 }
 
@@ -2112,8 +2115,8 @@ async function optimizeCoverImage(file) {
     img.src = sourceUrl;
   });
 
-  const maxWidth = 1600;
-  const maxHeight = 1600;
+  const maxWidth = 1280;
+  const maxHeight = 1280;
   const widthRatio = maxWidth / image.width;
   const heightRatio = maxHeight / image.height;
   const ratio = Math.min(1, widthRatio, heightRatio);
@@ -2130,8 +2133,7 @@ async function optimizeCoverImage(file) {
 
   context.drawImage(image, 0, 0, targetWidth, targetHeight);
 
-  const outputType = file.type === "image/png" ? "image/png" : "image/jpeg";
-  return canvas.toDataURL(outputType, outputType === "image/png" ? undefined : 0.88);
+  return canvas.toDataURL("image/jpeg", 0.82);
 }
 
 async function handleCoverUpload(file) {
@@ -2141,6 +2143,10 @@ async function handleCoverUpload(file) {
 
   try {
     const optimizedImage = await optimizeCoverImage(file);
+    if (optimizedImage.length > 3_500_000) {
+      showToast("圖片還是太大，請換更小的封面圖再試一次。");
+      return;
+    }
     state.admin.draft.coverImage = optimizedImage;
     markDraftDirty();
   } catch {
@@ -2255,6 +2261,11 @@ document.addEventListener("click", async (event) => {
 
     if (action === "save-event") {
       await saveDraft();
+      return;
+    }
+
+    if (action === "export-submissions") {
+      exportSubmissionsToExcel();
       return;
     }
 

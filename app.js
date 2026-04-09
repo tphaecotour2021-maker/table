@@ -6,6 +6,7 @@ const QUESTION_TYPE_OPTIONS = [
   { value: "longText", label: "長答" },
   { value: "email", label: "Email" },
   { value: "phone", label: "電話" },
+  { value: "idNumber", label: "身分證字號" },
   { value: "number", label: "數字" },
   { value: "singleChoice", label: "單選" },
   { value: "multiChoice", label: "複選" },
@@ -360,6 +361,10 @@ function normalizeAnswerForQuestion(question, value) {
     return Number.isFinite(parsed) ? String(parsed) : "";
   }
 
+  if (question.type === "idNumber") {
+    return value == null ? "" : String(value).trim().toUpperCase().replace(/[\s-]/g, "");
+  }
+
   return value == null ? "" : String(value);
 }
 
@@ -438,6 +443,187 @@ function validateRepeatAnswers(event, answers) {
   return errors;
 }
 
+function syncRunnerRepeatedAnswers(event, runner, totalParticipants) {
+  const repeatQuestions = getRepeatQuestions(event);
+
+  if (totalParticipants <= 1 || repeatQuestions.length === 0) {
+    runner.repeatedAnswers = [];
+    return;
+  }
+
+  const normalized = normalizeRepeatedAnswersForEvent(
+    event,
+    runner.repeatedAnswers,
+  ).filter((entry) => entry.participantNumber <= totalParticipants);
+  const existingParticipantNumbers = new Set(
+    normalized.map((entry) => entry.participantNumber),
+  );
+
+  for (let participantNumber = 2; participantNumber <= totalParticipants; participantNumber += 1) {
+    if (!existingParticipantNumbers.has(participantNumber)) {
+      normalized.push({
+        participantNumber,
+        answers: {},
+      });
+    }
+  }
+
+  runner.repeatedAnswers = normalizeRepeatedAnswersForEvent(event, normalized);
+}
+
+function findFirstInvalidRepeatParticipant(event, runner, totalParticipants) {
+  for (let participantNumber = 2; participantNumber <= totalParticipants; participantNumber += 1) {
+    const entry = ensureRepeatAnswerEntry(event, runner, participantNumber);
+    const errors = validateRepeatAnswers(event, entry?.answers || {});
+    if (Object.keys(errors).length) {
+      return {
+        participantNumber,
+        errors,
+      };
+    }
+  }
+
+  return null;
+}
+
+function moveRunnerToReviewStage(event, runner) {
+  const flowState = validateWholeFlow(event, runner.answers);
+  if (!flowState.ok) {
+    const firstError = flowState.errors[0];
+    if (firstError?.pageId) {
+      jumpToFlowQuestionFromReview(event, runner, firstError.pageId);
+      runner.errors = {
+        [firstError.questionId]: firstError.message,
+      };
+    }
+    return false;
+  }
+
+  const totalParticipants = computeParticipantsFromAnswers(event, runner.answers);
+  const repeatQuestions = getRepeatQuestions(event);
+
+  runner.finalParticipantCount = totalParticipants;
+  syncRunnerRepeatedAnswers(event, runner, totalParticipants);
+
+  if (totalParticipants > 1 && repeatQuestions.length > 0) {
+    const invalidRepeat = findFirstInvalidRepeatParticipant(event, runner, totalParticipants);
+    if (invalidRepeat) {
+      runner.stage = "repeat";
+      runner.repeatParticipantNumber = invalidRepeat.participantNumber;
+      runner.repeatErrors = invalidRepeat.errors;
+      return false;
+    }
+  }
+
+  runner.stage = "review";
+  runner.returnToReview = false;
+  runner.errors = {};
+  runner.repeatErrors = {};
+  return true;
+}
+
+function getReviewSections(event, runner) {
+  const flowState = validateWholeFlow(event, runner.answers);
+  const pageMap = new Map(event.pages.map((page) => [page.id, page]));
+  const sections = flowState.visitedPageIds
+    .map((pageId, index) => {
+      const page = pageMap.get(pageId);
+      if (!page) {
+        return null;
+      }
+
+      return {
+        kind: "flow",
+        title: page.title || `第 ${index + 1} 頁`,
+        description: page.description || "",
+        items: page.questions.map((question) => ({
+          id: question.id,
+          question,
+          answer: runner.answers?.[question.id],
+          action: "edit-flow-question",
+          actionLabel: "編輯",
+          dataAttributes: `data-page-id="${page.id}" data-question-id="${question.id}"`,
+        })),
+      };
+    })
+    .filter(Boolean);
+
+  const repeatQuestions = getRepeatQuestions(event);
+  const totalParticipants = Math.max(1, runner.finalParticipantCount || 1);
+
+  if (totalParticipants > 1 && repeatQuestions.length > 0) {
+    const repeatedAnswers = normalizeRepeatedAnswersForEvent(event, runner.repeatedAnswers);
+    for (let participantNumber = 2; participantNumber <= totalParticipants; participantNumber += 1) {
+      const entry = repeatedAnswers.find(
+        (item) => item.participantNumber === participantNumber,
+      );
+      sections.push({
+        kind: "repeat",
+        title: `第 ${participantNumber} 位同行`,
+        description: "",
+        items: repeatQuestions.map((question) => ({
+          id: `${participantNumber}_${question.id}`,
+          question,
+          answer: entry?.answers?.[question.id],
+          action: "edit-repeat-question",
+          actionLabel: "編輯",
+          dataAttributes: `data-participant-number="${participantNumber}" data-question-id="${question.id}"`,
+        })),
+      });
+    }
+  }
+
+  return sections;
+}
+
+function jumpToFlowQuestionFromReview(event, runner, pageId) {
+  const flowState = validateWholeFlow(event, runner.answers);
+  const pageIndex = flowState.visitedPageIds.indexOf(pageId);
+  runner.stage = "flow";
+  runner.currentPageId = pageId;
+  runner.history =
+    pageIndex >= 0 ? flowState.visitedPageIds.slice(0, pageIndex + 1) : [pageId];
+  runner.errors = {};
+  runner.returnToReview = true;
+}
+
+function jumpToRepeatQuestionFromReview(event, runner, participantNumber) {
+  runner.stage = "repeat";
+  runner.repeatParticipantNumber = participantNumber;
+  runner.repeatErrors = {};
+  runner.returnToReview = true;
+  ensureRepeatAnswerEntry(event, runner, participantNumber);
+}
+
+function goBackFromReview() {
+  const event = getSelectedPublicEvent();
+  const runner = state.public.runner;
+  if (!event || !runner) {
+    return;
+  }
+
+  const totalParticipants = Math.max(1, runner.finalParticipantCount || 1);
+  const repeatQuestions = getRepeatQuestions(event);
+
+  if (totalParticipants > 1 && repeatQuestions.length > 0) {
+    jumpToRepeatQuestionFromReview(event, runner, totalParticipants);
+    runner.returnToReview = false;
+    renderPublicDetail();
+    return;
+  }
+
+  const flowState = validateWholeFlow(event, runner.answers);
+  const lastVisitedPageId =
+    flowState.visitedPageIds[flowState.visitedPageIds.length - 1] || event.pages[0]?.id || null;
+  if (!lastVisitedPageId) {
+    return;
+  }
+
+  jumpToFlowQuestionFromReview(event, runner, lastVisitedPageId);
+  runner.returnToReview = false;
+  renderPublicDetail();
+}
+
 function resolveNextPageId(event, currentPageId, answers) {
   const pageIndex = event.pages.findIndex((page) => page.id === currentPageId);
   const page = event.pages[pageIndex];
@@ -497,6 +683,13 @@ function validateQuestion(question, answer) {
     const phonePattern = /^[0-9+\-()#\s]{6,}$/;
     if (!phonePattern.test(answer)) {
       return `${question.label} 需要填寫有效的電話。`;
+    }
+  }
+
+  if (question.type === "idNumber" && answer) {
+    const idPattern = /^[A-Z][A-Z0-9]\d{8}$/;
+    if (!idPattern.test(String(answer).toUpperCase())) {
+      return `${question.label} 需要填寫 10 碼有效身分證字號。`;
     }
   }
 
@@ -753,6 +946,7 @@ function ensureRunnerForEvent(eventId) {
     repeatErrors: {},
     repeatParticipantNumber: 2,
     finalParticipantCount: 1,
+    returnToReview: false,
     submitting: false,
     submitted: false,
     success: null,
@@ -943,17 +1137,24 @@ function renderInputField(question, value, error) {
     shortText: "text",
     email: "email",
     phone: "tel",
+    idNumber: "text",
     number: "number",
     date: "date",
   };
+
+  const inputValue =
+    question.type === "idNumber"
+      ? normalizeAnswerForQuestion(question, value)
+      : value || "";
 
   return `
     <input
       class="input"
       type="${typeMap[question.type] || "text"}"
       data-public-question="${question.id}"
-      value="${escapeHtml(value || "")}"
+      value="${escapeHtml(inputValue)}"
       placeholder="${escapeHtml(question.placeholder || "")}"
+      ${question.type === "idNumber" ? `maxlength="10" autocapitalize="characters" spellcheck="false"` : ""}
     />
     ${error ? `<div class="question-error">${escapeHtml(error)}</div>` : ""}
   `;
@@ -1001,6 +1202,78 @@ function renderPublicDetail() {
   }
 
   const isFull = event.remainingCapacity === 0;
+
+  if (runner?.stage === "review") {
+    const reviewSections = getReviewSections(event, runner);
+    const totalParticipants = Math.max(1, runner.finalParticipantCount || 1);
+
+    dom.publicDetail.innerHTML = `
+      <div class="registration-shell">
+        <div class="registration-cover">
+          ${event.coverImage ? `<img data-image-role="public-detail" data-event-id="${event.id}" alt="${escapeHtml(event.title)} 封面" />` : ""}
+        </div>
+        <div class="chip-row">
+          <span class="status-pill ${isFull ? "full" : "live"}">${isFull ? "名額已滿" : "確認資料"}</span>
+          <span class="meta-pill">${totalParticipants} 人</span>
+          ${
+            event.remainingCapacity == null
+              ? ""
+              : `<span class="meta-pill">剩餘 ${event.remainingCapacity} 人</span>`
+          }
+        </div>
+        <h3 style="margin-top: 14px;">${escapeHtml(event.title)}</h3>
+        <p class="page-description" style="margin-top: 12px;">送出前再確認一次資料，如果有誤可以直接點該題的編輯。</p>
+        <div class="progress-track">
+          <div class="progress-bar" style="width: 100%"></div>
+        </div>
+        <div class="review-list">
+          ${reviewSections
+            .map(
+              (section) => `
+                <section class="review-section-card">
+                  <div class="split-row review-section-header">
+                    <div>
+                      <h4>${escapeHtml(section.title)}</h4>
+                      ${section.description ? `<p class="field-help">${nl2br(section.description)}</p>` : ""}
+                    </div>
+                  </div>
+                  <div class="review-item-list">
+                    ${section.items
+                      .map(
+                        (item) => `
+                          <div class="review-row">
+                            <div class="review-row-copy">
+                              <div class="question-label">
+                                <span>${escapeHtml(item.question.label)}</span>
+                                ${item.question.required ? `<span class="required-badge">*</span>` : ""}
+                              </div>
+                              <div class="review-answer">${nl2br(formatSubmissionAnswer(item.question, item.answer) || "未填寫")}</div>
+                            </div>
+                            <button class="text-button" type="button" data-public-action="${item.action}" ${item.dataAttributes}>
+                              ${item.actionLabel}
+                            </button>
+                          </div>
+                        `,
+                      )
+                      .join("")}
+                  </div>
+                </section>
+              `,
+            )
+            .join("")}
+        </div>
+        <div class="action-row" style="margin-top: 24px;">
+          <button class="secondary-button" type="button" data-public-action="review-back">返回上一段</button>
+          <button class="primary-button" type="button" data-public-action="submit" ${runner.submitting ? "disabled" : ""}>
+            ${runner.submitting ? "送出中..." : "確認送出"}
+          </button>
+          <button class="text-button" type="button" data-public-action="restart">重新開始</button>
+          <button class="text-button" type="button" data-public-action="close">關閉</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
 
   if (runner?.stage === "repeat") {
     const totalParticipants = Math.max(2, runner.finalParticipantCount || 2);
@@ -1060,8 +1333,10 @@ function renderPublicDetail() {
                   ${
                     runner.submitting
                       ? "送出中..."
-                      : isFinalRepeatParticipant
-                        ? "送出報名"
+                      : runner.returnToReview
+                        ? "回確認頁"
+                        : isFinalRepeatParticipant
+                        ? "確認資料"
                         : "下一位同行"
                   }
                 </button>
@@ -1148,10 +1423,12 @@ function renderPublicDetail() {
                 ${
                   runner.submitting
                     ? "送出中..."
+                    : runner.returnToReview
+                      ? "回確認頁"
                     : isFinalPage
                       ? needsRepeatedQuestions
                         ? "下一位同行"
-                        : "送出報名"
+                        : "確認資料"
                       : "下一頁"
                 }
               </button>
@@ -2210,7 +2487,10 @@ function updateRunnerAnswer(questionId, value, checked, shouldRender = false) {
       targetAnswers[questionId] = current;
     }
   } else {
-    targetAnswers[questionId] = value;
+    targetAnswers[questionId] =
+      question.type === "idNumber"
+        ? normalizeAnswerForQuestion(question, value)
+        : value;
   }
 
   if (runner.stage === "repeat") {
@@ -2233,6 +2513,11 @@ function goToPreviousPage() {
   const event = getSelectedPublicEvent();
   const runner = state.public.runner;
   if (!runner) {
+    return;
+  }
+
+  if (runner.stage === "review") {
+    goBackFromReview();
     return;
   }
 
@@ -2271,6 +2556,12 @@ function goToNextPage() {
     return;
   }
 
+  if (runner.returnToReview) {
+    moveRunnerToReviewStage(event, runner);
+    renderPublicDetail();
+    return;
+  }
+
   const nextPageId = resolveNextPageId(event, runner.currentPageId, normalizeAnswersForEvent(event, runner.answers));
   if (!nextPageId) {
     submitRegistration();
@@ -2294,6 +2585,41 @@ async function submitRegistration() {
     return;
   }
 
+  if (runner.stage === "review") {
+    runner.submitting = true;
+    renderPublicDetail();
+
+    try {
+      const payload = await api.submitRegistration(
+        event.id,
+        runner.answers,
+        normalizeRepeatedAnswersForEvent(event, runner.repeatedAnswers).filter(
+          (entry) => entry.participantNumber <= Math.max(1, runner.finalParticipantCount || 1),
+        ),
+      );
+      runner.submitted = true;
+      runner.success = {
+        totalParticipants: payload.totalParticipants,
+        summary: payload.summary,
+      };
+      await loadPublicEvents();
+      ensureRunnerForEvent(event.id);
+      state.public.runner = {
+        ...state.public.runner,
+        submitting: false,
+        submitted: true,
+        success: runner.success,
+      };
+      renderPublic();
+      showToast("報名已送出。");
+    } catch (error) {
+      runner.submitting = false;
+      renderPublicDetail();
+      showToast(error.message || "送出失敗。");
+    }
+    return;
+  }
+
   if (runner.stage === "repeat") {
     const currentEntry = ensureRepeatAnswerEntry(event, runner, runner.repeatParticipantNumber);
     const currentAnswers = normalizeRepeatedAnswersForEvent(event, [currentEntry || {}])[0]?.answers || {};
@@ -2309,6 +2635,12 @@ async function submitRegistration() {
       currentEntry.answers = currentAnswers;
     }
 
+    if (runner.returnToReview) {
+      moveRunnerToReviewStage(event, runner);
+      renderPublicDetail();
+      return;
+    }
+
     if (runner.repeatParticipantNumber < runner.finalParticipantCount) {
       runner.repeatParticipantNumber += 1;
       runner.repeatErrors = {};
@@ -2320,6 +2652,12 @@ async function submitRegistration() {
     const errors = validateCurrentPage(event, runner.currentPageId, runner.answers);
     if (Object.keys(errors).length) {
       runner.errors = errors;
+      renderPublicDetail();
+      return;
+    }
+
+    if (runner.returnToReview) {
+      moveRunnerToReviewStage(event, runner);
       renderPublicDetail();
       return;
     }
@@ -2338,37 +2676,8 @@ async function submitRegistration() {
     }
   }
 
-  runner.submitting = true;
+  moveRunnerToReviewStage(event, runner);
   renderPublicDetail();
-
-  try {
-    const payload = await api.submitRegistration(
-      event.id,
-      runner.answers,
-      normalizeRepeatedAnswersForEvent(event, runner.repeatedAnswers).filter(
-        (entry) => entry.participantNumber <= Math.max(1, runner.finalParticipantCount || 1),
-      ),
-    );
-    runner.submitted = true;
-    runner.success = {
-      totalParticipants: payload.totalParticipants,
-      summary: payload.summary,
-    };
-    await loadPublicEvents();
-    ensureRunnerForEvent(event.id);
-    state.public.runner = {
-      ...state.public.runner,
-      submitting: false,
-      submitted: true,
-      success: runner.success,
-    };
-    renderPublic();
-    showToast("報名已送出。");
-  } catch (error) {
-    runner.submitting = false;
-    renderPublicDetail();
-    showToast(error.message || "送出失敗。");
-  }
 }
 
 function restartRegistration() {
@@ -2388,6 +2697,7 @@ function restartRegistration() {
     repeatErrors: {},
     repeatParticipantNumber: 2,
     finalParticipantCount: 1,
+    returnToReview: false,
     submitting: false,
     submitted: false,
     success: null,
@@ -2709,6 +3019,8 @@ document.addEventListener("click", async (event) => {
   const publicAction = target.closest("[data-public-action]");
   if (publicAction instanceof HTMLElement) {
     const action = publicAction.dataset.publicAction;
+    const event = getSelectedPublicEvent();
+    const runner = state.public.runner;
 
     if (action === "prev") {
       goToPreviousPage();
@@ -2727,6 +3039,29 @@ document.addEventListener("click", async (event) => {
 
     if (action === "restart") {
       restartRegistration();
+      return;
+    }
+
+    if (action === "review-back") {
+      goBackFromReview();
+      return;
+    }
+
+    if (action === "edit-flow-question" && event && runner && publicAction.dataset.pageId) {
+      jumpToFlowQuestionFromReview(event, runner, publicAction.dataset.pageId);
+      renderPublicDetail();
+      return;
+    }
+
+    if (action === "edit-repeat-question" && event && runner) {
+      const participantNumber = Number.parseInt(
+        publicAction.dataset.participantNumber || "",
+        10,
+      );
+      if (participantNumber >= 2) {
+        jumpToRepeatQuestionFromReview(event, runner, participantNumber);
+        renderPublicDetail();
+      }
       return;
     }
 

@@ -496,6 +496,54 @@ button:disabled {
   margin-top: 18px;
 }
 
+.review-list,
+.review-item-list {
+  display: grid;
+  gap: 14px;
+}
+
+.review-section-card {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.review-section-header {
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+
+.review-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  padding-top: 14px;
+  margin-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.review-item-list .review-row:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.review-row-copy {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.review-answer {
+  color: var(--muted);
+  line-height: 1.7;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .question-label {
   display: flex;
   gap: 8px;

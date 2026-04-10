@@ -30,6 +30,101 @@ export function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function normalizeMoneyValue(value) {
+  if (value === "" || value == null) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.max(0, Math.round(parsed * 100) / 100);
+}
+
+function roundMoney(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+function normalizeDateTimeValue(value) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) {
+    return "";
+  }
+
+  return parsed.toISOString();
+}
+
+export function createPricingConfig() {
+  return {
+    enabled: false,
+    originalPrice: null,
+    discountPrice: null,
+    groupEnabled: false,
+    groupThreshold: null,
+    groupPrice: null,
+    earlyBirdEnabled: false,
+    earlyBirdDeadline: "",
+    earlyBirdPrice: null,
+    confirmationFieldEnabled: false,
+    confirmationFieldLabel: "",
+    confirmationFieldPlaceholder: "",
+    confirmationFieldRequired: false,
+  };
+}
+
+export function normalizePricingConfig(pricing) {
+  const fallback = createPricingConfig();
+
+  return {
+    enabled: Boolean(pricing?.enabled),
+    originalPrice: normalizeMoneyValue(pricing?.originalPrice),
+    discountPrice: normalizeMoneyValue(pricing?.discountPrice),
+    groupEnabled: Boolean(pricing?.groupEnabled),
+    groupThreshold:
+      pricing?.groupThreshold === "" || pricing?.groupThreshold == null
+        ? null
+        : Math.max(1, Number.parseInt(pricing.groupThreshold, 10) || 0) || null,
+    groupPrice: normalizeMoneyValue(pricing?.groupPrice),
+    earlyBirdEnabled: Boolean(pricing?.earlyBirdEnabled),
+    earlyBirdDeadline: normalizeDateTimeValue(pricing?.earlyBirdDeadline),
+    earlyBirdPrice: normalizeMoneyValue(pricing?.earlyBirdPrice),
+    confirmationFieldEnabled: Boolean(pricing?.confirmationFieldEnabled),
+    confirmationFieldLabel: String(
+      pricing?.confirmationFieldLabel || fallback.confirmationFieldLabel,
+    ).trim(),
+    confirmationFieldPlaceholder: String(
+      pricing?.confirmationFieldPlaceholder || fallback.confirmationFieldPlaceholder,
+    ).trim(),
+    confirmationFieldRequired: Boolean(pricing?.confirmationFieldRequired),
+  };
+}
+
+function normalizeSubmissionPricing(pricing) {
+  if (!pricing || typeof pricing !== "object") {
+    return null;
+  }
+
+  return {
+    tierKey: String(pricing?.tierKey || "").trim(),
+    tierLabel: String(pricing?.tierLabel || "").trim(),
+    unitPrice: normalizeMoneyValue(pricing?.unitPrice),
+    originalUnitPrice: normalizeMoneyValue(pricing?.originalUnitPrice),
+    totalPrice: normalizeMoneyValue(pricing?.totalPrice),
+    participants:
+      pricing?.participants == null
+        ? null
+        : Math.max(1, Number.parseInt(pricing.participants, 10) || 0) || null,
+    confirmationValue: String(pricing?.confirmationValue || "").trim(),
+    confirmationFieldLabel: String(pricing?.confirmationFieldLabel || "").trim(),
+  };
+}
+
 export function supportsOptions(type) {
   return OPTION_TYPES.has(type);
 }
@@ -107,6 +202,7 @@ export function normalizeEvent(event) {
         ? null
         : Math.max(1, Number.parseInt(event.capacity, 10) || 0) || null,
     status: event?.status === "draft" ? "draft" : "published",
+    pricing: normalizePricingConfig(event?.pricing),
     createdAt: event?.createdAt || now,
     updatedAt: event?.updatedAt || now,
     pages: pages.map((page, index) => normalizePage(page, index)),
@@ -202,6 +298,7 @@ function normalizeSubmission(submission) {
       ? submission.visitedPageIds.map((value) => String(value))
       : [],
     answers: typeof submission?.answers === "object" && submission.answers ? submission.answers : {},
+    pricing: normalizeSubmissionPricing(submission?.pricing),
     repeatedAnswers: Array.isArray(submission?.repeatedAnswers)
       ? submission.repeatedAnswers
           .map((entry, index) => ({
@@ -417,7 +514,13 @@ export function resolveNextPageId(event, currentPageId, answers) {
   return event.pages[pageIndex + 1]?.id || null;
 }
 
-export function validateSubmission(event, answers, repeatedAnswers) {
+export function validateSubmission(
+  event,
+  answers,
+  repeatedAnswers,
+  pricingConfirmationValue = "",
+  referenceTime = new Date().toISOString(),
+) {
   const sanitizedAnswers = sanitizeAnswersForStorage(event, answers);
   const totalParticipants = computeSubmissionParticipants(event, sanitizedAnswers);
   const sanitizedRepeatedAnswers = sanitizeRepeatedAnswersForStorage(
@@ -425,6 +528,8 @@ export function validateSubmission(event, answers, repeatedAnswers) {
     repeatedAnswers,
   ).filter((entry) => entry.participantNumber <= totalParticipants);
   const repeatQuestions = getRepeatQuestions(event);
+  const pricing = normalizePricingConfig(event?.pricing);
+  const normalizedPricingConfirmationValue = String(pricingConfirmationValue || "").trim();
   const errors = [];
   const visitedPageIds = [];
   const pageMap = new Map(event.pages.map((page) => [page.id, page]));
@@ -472,6 +577,21 @@ export function validateSubmission(event, answers, repeatedAnswers) {
     }
   }
 
+  if (
+    pricing.enabled &&
+    pricing.confirmationFieldEnabled &&
+    pricing.confirmationFieldRequired &&
+    !normalizedPricingConfirmationValue
+  ) {
+    errors.push({
+      pageId: null,
+      questionId: "__pricing_confirmation__",
+      message: `${pricing.confirmationFieldLabel || "確認欄位"} 為必填。`,
+    });
+  }
+
+  const pricingQuote = computePricingQuote(event, sanitizedAnswers, referenceTime);
+
   return {
     ok: errors.length === 0,
     errors,
@@ -479,6 +599,8 @@ export function validateSubmission(event, answers, repeatedAnswers) {
     sanitizedAnswers,
     sanitizedRepeatedAnswers,
     totalParticipants,
+    pricingQuote,
+    pricingConfirmationValue: normalizedPricingConfirmationValue,
   };
 }
 
@@ -500,6 +622,81 @@ export function computeSubmissionParticipants(event, answers) {
   return Math.max(1, total);
 }
 
+export function computePricingQuote(event, answers, referenceTime = new Date().toISOString()) {
+  const pricing = normalizePricingConfig(event?.pricing);
+  if (!pricing.enabled) {
+    return null;
+  }
+
+  const participants = computeSubmissionParticipants(event, answers);
+  const candidates = [];
+  const basePrice = pricing.discountPrice ?? pricing.originalPrice;
+
+  if (basePrice != null) {
+    candidates.push({
+      tierKey: pricing.discountPrice != null ? "discount" : "original",
+      tierLabel: pricing.discountPrice != null ? "優惠價" : "原價",
+      unitPrice: basePrice,
+      priority: 1,
+    });
+  }
+
+  if (
+    pricing.groupEnabled &&
+    pricing.groupThreshold != null &&
+    pricing.groupPrice != null &&
+    participants >= pricing.groupThreshold
+  ) {
+    candidates.push({
+      tierKey: "group",
+      tierLabel: `團體價（${pricing.groupThreshold} 人以上）`,
+      unitPrice: pricing.groupPrice,
+      priority: 2,
+    });
+  }
+
+  if (
+    pricing.earlyBirdEnabled &&
+    pricing.earlyBirdDeadline &&
+    pricing.earlyBirdPrice != null &&
+    new Date(referenceTime).valueOf() <= new Date(pricing.earlyBirdDeadline).valueOf()
+  ) {
+    candidates.push({
+      tierKey: "earlyBird",
+      tierLabel: "早鳥價",
+      unitPrice: pricing.earlyBirdPrice,
+      priority: 3,
+    });
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    if (left.unitPrice !== right.unitPrice) {
+      return left.unitPrice - right.unitPrice;
+    }
+    return right.priority - left.priority;
+  });
+
+  const applied = candidates[0];
+  const originalUnitPrice =
+    pricing.originalPrice != null && pricing.originalPrice > applied.unitPrice
+      ? pricing.originalPrice
+      : null;
+
+  return {
+    tierKey: applied.tierKey,
+    tierLabel: applied.tierLabel,
+    unitPrice: applied.unitPrice,
+    originalUnitPrice,
+    totalPrice: roundMoney(applied.unitPrice * participants),
+    participants,
+    confirmationFieldLabel: pricing.confirmationFieldLabel,
+  };
+}
+
 export function sanitizeEventForPublic(event) {
   return {
     id: event.id,
@@ -509,6 +706,7 @@ export function sanitizeEventForPublic(event) {
     capacity: event.capacity,
     remainingCapacity: computeRemainingCapacity(event),
     status: event.status,
+    pricing: clone(event.pricing),
     createdAt: event.createdAt,
     updatedAt: event.updatedAt,
     pages: clone(event.pages),

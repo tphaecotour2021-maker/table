@@ -194,6 +194,15 @@ function createPricingConfig() {
   };
 }
 
+function createCarpoolConfig() {
+  return {
+    enabled: false,
+    price: null,
+    capacity: null,
+    description: "",
+  };
+}
+
 function normalizePricingConfig(pricing) {
   const fallback = createPricingConfig();
 
@@ -221,6 +230,18 @@ function normalizePricingConfig(pricing) {
   };
 }
 
+function normalizeCarpoolConfig(carpool) {
+  return {
+    enabled: Boolean(carpool?.enabled),
+    price: normalizeMoneyValue(carpool?.price),
+    capacity:
+      carpool?.capacity === "" || carpool?.capacity == null
+        ? null
+        : Math.max(1, Number.parseInt(carpool.capacity, 10) || 0) || null,
+    description: String(carpool?.description || "").trim(),
+  };
+}
+
 function normalizeSubmissionPricing(pricing) {
   if (!pricing || typeof pricing !== "object") {
     return null;
@@ -241,8 +262,30 @@ function normalizeSubmissionPricing(pricing) {
   };
 }
 
+function normalizeSubmissionCarpool(carpool) {
+  if (!carpool || typeof carpool !== "object") {
+    return null;
+  }
+
+  const quantity = Math.max(0, Number.parseInt(carpool?.quantity, 10) || 0);
+  if (quantity <= 0) {
+    return null;
+  }
+
+  return {
+    quantity,
+    unitPrice: normalizeMoneyValue(carpool?.unitPrice),
+    totalPrice: normalizeMoneyValue(carpool?.totalPrice),
+    description: String(carpool?.description || "").trim(),
+  };
+}
+
 function hasPricingFeatureEnabled(event) {
   return Boolean(event?.pricing?.enabled);
+}
+
+function hasCarpoolFeatureEnabled(event) {
+  return Boolean(event?.carpool?.enabled);
 }
 
 function summarizeRemainingCapacity(events) {
@@ -268,6 +311,22 @@ function computeRemainingCapacity(event) {
   }
 
   return Math.max(0, event.capacity - computeUsedCapacity(event));
+}
+
+function computeUsedCarpoolCapacity(event) {
+  return (event.submissions || []).reduce(
+    (sum, submission) => sum + (Number.parseInt(submission.carpool?.quantity, 10) || 0),
+    0,
+  );
+}
+
+function computeRemainingCarpoolCapacity(event) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  if (!carpool.enabled || carpool.capacity == null) {
+    return null;
+  }
+
+  return Math.max(0, carpool.capacity - computeUsedCarpoolCapacity(event));
 }
 
 function createOption(label = "新選項") {
@@ -330,6 +389,7 @@ function createEmptyEvent() {
     capacity: 50,
     status: "published",
     pricing: createPricingConfig(),
+    carpool: createCarpoolConfig(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     pages: [page],
@@ -394,6 +454,7 @@ function normalizeSubmission(submission) {
       : [],
     answers: submission?.answers && typeof submission.answers === "object" ? submission.answers : {},
     pricing: normalizeSubmissionPricing(submission?.pricing),
+    carpool: normalizeSubmissionCarpool(submission?.carpool),
     repeatedAnswers: Array.isArray(submission?.repeatedAnswers)
       ? submission.repeatedAnswers
           .map((entry, index) => ({
@@ -420,6 +481,7 @@ function normalizeEvent(event) {
         : Math.max(1, Number.parseInt(event.capacity, 10) || 0) || null,
     status: event?.status === "draft" ? "draft" : "published",
     pricing: normalizePricingConfig(event?.pricing),
+    carpool: normalizeCarpoolConfig(event?.carpool),
     createdAt: event?.createdAt || new Date().toISOString(),
     updatedAt: event?.updatedAt || new Date().toISOString(),
     pages: (Array.isArray(event?.pages) && event.pages.length ? event.pages : [createPage()]).map(
@@ -442,6 +504,10 @@ function sanitizeEventForPublic(event) {
     remainingCapacity: computeRemainingCapacity(normalized),
     status: normalized.status,
     pricing: deepClone(normalized.pricing),
+    carpool: {
+      ...deepClone(normalized.carpool),
+      remainingCapacity: computeRemainingCarpoolCapacity(normalized),
+    },
     pages: deepClone(normalized.pages),
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
@@ -666,6 +732,11 @@ function validateReviewStage(event, runner) {
     errors.pricingConfirmation = `${pricing.confirmationFieldLabel || "確認欄位"} 為必填。`;
   }
 
+  const carpoolError = validateCarpoolSelection(event, runner);
+  if (carpoolError) {
+    errors.carpool = carpoolError;
+  }
+
   return errors;
 }
 
@@ -742,6 +813,17 @@ function jumpToRepeatQuestionFromReview(event, runner, participantNumber) {
   runner.returnToReview = true;
   runner.reviewErrors = {};
   ensureRepeatAnswerEntry(event, runner, participantNumber);
+}
+
+function jumpToCarpoolFromReview(event, runner) {
+  const flowState = validateWholeFlow(event, runner.answers);
+  const lastVisitedPageId =
+    flowState.visitedPageIds[flowState.visitedPageIds.length - 1] || event.pages[0]?.id || null;
+  if (!lastVisitedPageId) {
+    return;
+  }
+
+  jumpToFlowQuestionFromReview(event, runner, lastVisitedPageId);
 }
 
 function goBackFromReview() {
@@ -1016,6 +1098,189 @@ function getPricingQuote(event, answers, referenceTime = new Date().toISOString(
   };
 }
 
+function normalizeRunnerCarpoolSelection(selection) {
+  const requested = Boolean(selection?.requested);
+  const quantity = requested ? Math.max(1, Number.parseInt(selection?.quantity, 10) || 1) : 0;
+
+  return {
+    requested,
+    quantity,
+  };
+}
+
+function getCarpoolQuote(event, selection) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  const normalizedSelection = normalizeRunnerCarpoolSelection(selection);
+  if (!carpool.enabled || !normalizedSelection.requested || normalizedSelection.quantity <= 0) {
+    return null;
+  }
+
+  const unitPrice = carpool.price ?? 0;
+  return {
+    quantity: normalizedSelection.quantity,
+    unitPrice,
+    totalPrice: roundMoney(unitPrice * normalizedSelection.quantity),
+    remainingCapacity:
+      event?.carpool?.remainingCapacity == null
+        ? computeRemainingCarpoolCapacity(event)
+        : event.carpool.remainingCapacity,
+    description: carpool.description,
+  };
+}
+
+function getCheckoutTotal(event, answers, carpoolSelection) {
+  const pricingQuote = getPricingQuote(event, answers);
+  const carpoolQuote = getCarpoolQuote(event, carpoolSelection);
+  const totalPrice = roundMoney((pricingQuote?.totalPrice || 0) + (carpoolQuote?.totalPrice || 0));
+
+  if (!pricingQuote && !carpoolQuote) {
+    return null;
+  }
+
+  return {
+    pricingQuote,
+    carpoolQuote,
+    totalPrice,
+  };
+}
+
+function validateCarpoolSelection(event, runner) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  const selection = normalizeRunnerCarpoolSelection(runner?.carpoolSelection);
+  if (!carpool.enabled || !selection.requested) {
+    return "";
+  }
+
+  if (selection.quantity < 1) {
+    return "請填寫共乘人數。";
+  }
+
+  const participants = Math.max(1, runner?.finalParticipantCount || computeParticipantsFromAnswers(event, runner?.answers || {}));
+  if (selection.quantity > participants) {
+    return `共乘人數不能超過報名總人數 ${participants} 人。`;
+  }
+
+  const remaining = event?.carpool?.remainingCapacity == null
+    ? computeRemainingCarpoolCapacity(event)
+    : event.carpool.remainingCapacity;
+  if (remaining != null && selection.quantity > remaining) {
+    return `共乘名額不足，目前只剩 ${remaining} 位。`;
+  }
+
+  return "";
+}
+
+function renderCarpoolSelector(event, runner, options = {}) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  if (!carpool.enabled) {
+    return "";
+  }
+
+  const selection = normalizeRunnerCarpoolSelection(runner?.carpoolSelection);
+  const participants = Math.max(1, runner?.finalParticipantCount || computeParticipantsFromAnswers(event, runner?.answers || {}));
+  const remaining = event?.carpool?.remainingCapacity == null
+    ? computeRemainingCarpoolCapacity(event)
+    : event.carpool.remainingCapacity;
+  const maxQuantity = Math.max(1, Math.min(participants, remaining ?? participants));
+  const quote = getCarpoolQuote(event, selection);
+  const error = options.error || "";
+
+  return `
+    <section class="price-card ${options.compact ? "price-card-compact" : ""}">
+      <div class="split-row review-section-header">
+        <div>
+          <h4>共乘</h4>
+          ${carpool.description ? `<p class="field-help">${nl2br(carpool.description)}</p>` : ""}
+        </div>
+        ${carpool.price != null ? `<div class="price-total-copy">${escapeHtml(formatMoney(carpool.price))} / 位</div>` : ""}
+      </div>
+      <div class="meta-row" style="margin-top: 12px;">
+        ${
+          remaining == null
+            ? `<span class="meta-pill">不限名額</span>`
+            : `<span class="meta-pill">剩餘 ${remaining} 位</span>`
+        }
+        ${quote ? `<span class="meta-pill">共乘小計 ${escapeHtml(formatMoney(quote.totalPrice))}</span>` : ""}
+      </div>
+      <label class="inline-checkbox" style="margin-top: 14px;">
+        <input type="checkbox" data-public-carpool-field="requested" ${selection.requested ? "checked" : ""} />
+        <span>我需要共乘</span>
+      </label>
+      ${
+        selection.requested
+          ? `
+            <div class="field" style="margin-top: 12px;">
+              <label>共乘人數</label>
+              <input class="input" type="number" min="1" max="${maxQuantity}" value="${escapeHtml(selection.quantity || 1)}" data-public-carpool-field="quantity" />
+            </div>
+          `
+          : ""
+      }
+      ${error ? `<div class="question-error">${escapeHtml(error)}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderCarpoolReview(event, runner) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  if (!carpool.enabled) {
+    return "";
+  }
+
+  const quote = getCarpoolQuote(event, runner?.carpoolSelection);
+
+  return `
+    <section class="review-section-card">
+      <div class="review-row" style="border-top: 0; margin-top: 0; padding-top: 0;">
+        <div class="review-row-copy">
+          <div class="question-label">
+            <span>共乘</span>
+          </div>
+          <div class="review-answer">
+            ${
+              quote
+                ? `需要，共 ${quote.quantity} 位，${escapeHtml(formatMoney(quote.unitPrice))} / 位，共 ${escapeHtml(formatMoney(quote.totalPrice))}`
+                : "不需要"
+            }
+          </div>
+        </div>
+        <button class="text-button" type="button" data-public-action="edit-carpool">編輯</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderCheckoutTotal(event, runner) {
+  const checkout = getCheckoutTotal(event, runner?.answers || {}, runner?.carpoolSelection);
+  if (!checkout) {
+    return "";
+  }
+
+  return `
+    <section class="price-card">
+      <div class="split-row review-section-header">
+        <div>
+          <h4>費用總計</h4>
+          <p class="field-help">包含活動費用與已選擇的共乘費用。</p>
+        </div>
+        <div class="price-total-copy">${escapeHtml(formatMoney(checkout.totalPrice))}</div>
+      </div>
+      <div class="meta-row" style="margin-top: 12px;">
+        ${
+          checkout.pricingQuote
+            ? `<span class="meta-pill">活動 ${escapeHtml(formatMoney(checkout.pricingQuote.totalPrice))}</span>`
+            : ""
+        }
+        ${
+          checkout.carpoolQuote
+            ? `<span class="meta-pill">共乘 ${escapeHtml(formatMoney(checkout.carpoolQuote.totalPrice))}</span>`
+            : ""
+        }
+      </div>
+    </section>
+  `;
+}
+
 function renderPricingSummary(event, answers, options = {}) {
   const quote = getPricingQuote(event, answers, options.referenceTime);
   const pricing = normalizePricingConfig(event?.pricing);
@@ -1204,7 +1469,13 @@ const api = {
     });
   },
 
-  async submitRegistration(eventId, answers, repeatedAnswers = [], pricingConfirmationValue = "") {
+  async submitRegistration(
+    eventId,
+    answers,
+    repeatedAnswers = [],
+    pricingConfirmationValue = "",
+    carpoolSelection = {},
+  ) {
     return requestRemote("register", {
       method: "POST",
       body: JSON.stringify({
@@ -1212,6 +1483,7 @@ const api = {
         answers,
         repeatedAnswers,
         pricingConfirmationValue,
+        carpoolSelection,
       }),
     });
   },
@@ -1262,6 +1534,10 @@ function ensureRunnerForEvent(eventId) {
     finalParticipantCount: 1,
     returnToReview: false,
     pricingConfirmationValue: "",
+    carpoolSelection: {
+      requested: false,
+      quantity: 0,
+    },
     reviewErrors: {},
     submitting: false,
     submitted: false,
@@ -1589,6 +1865,9 @@ function renderPublicDetail() {
               })
             : ""
         }
+        ${hasCarpoolFeatureEnabled(event) ? renderCarpoolReview(event, runner) : ""}
+        ${renderCheckoutTotal(event, runner)}
+        ${reviewErrors.carpool ? `<div class="question-error">${escapeHtml(reviewErrors.carpool)}</div>` : ""}
         <div class="action-row" style="margin-top: 24px;">
           <button class="secondary-button" type="button" data-public-action="review-back">返回上一段</button>
           <button class="primary-button" type="button" data-public-action="submit" ${runner.submitting ? "disabled" : ""}>
@@ -1640,6 +1919,15 @@ function renderPublicDetail() {
               })
             : ""
         }
+        ${
+          hasCarpoolFeatureEnabled(event)
+            ? renderCarpoolSelector(event, runner, {
+                compact: true,
+                error: runner.errors?.__carpool__,
+              })
+            : ""
+        }
+        ${getCarpoolQuote(event, runner.carpoolSelection) ? renderCheckoutTotal(event, runner) : ""}
         ${
           isFull
             ? `<div class="empty-state" style="margin-top: 20px;"><h3>這個活動目前已額滿</h3></div>`
@@ -1761,6 +2049,14 @@ function renderPublicDetail() {
                 `;
               })
               .join("")}
+            ${
+              isFinalPage && hasCarpoolFeatureEnabled(event)
+                ? renderCarpoolSelector(event, runner, {
+                    error: runner.errors?.__carpool__,
+                  })
+                : ""
+            }
+            ${isFinalPage && getCarpoolQuote(event, runner.carpoolSelection) ? renderCheckoutTotal(event, runner) : ""}
             <div class="action-row" style="margin-top: 24px;">
               ${
                 runner.history.length > 1
@@ -2155,7 +2451,17 @@ function getSubmissionColumns(event) {
     }
   }
 
-  return [...baseColumns, ...repeatedColumns, ...pricingColumns];
+  const carpoolColumns = [];
+  const hasCarpoolData = (event.submissions || []).some((submission) => submission.carpool);
+  if (hasCarpoolData) {
+    carpoolColumns.push(
+      { kind: "carpool", field: "quantity", header: "共乘人數" },
+      { kind: "carpool", field: "unitPrice", header: "共乘單價" },
+      { kind: "carpool", field: "totalPrice", header: "共乘小計" },
+    );
+  }
+
+  return [...baseColumns, ...repeatedColumns, ...pricingColumns, ...carpoolColumns];
 }
 
 function formatSubmissionAnswer(question, answer) {
@@ -2206,6 +2512,14 @@ function getSubmissionRows(event) {
               return pricingValue == null ? "" : formatMoney(pricingValue);
             }
             return pricingValue == null ? "" : String(pricingValue);
+          }
+
+          if (column.kind === "carpool") {
+            const carpoolValue = submission.carpool?.[column.field];
+            if (column.field === "unitPrice" || column.field === "totalPrice") {
+              return carpoolValue == null ? "" : formatMoney(carpoolValue);
+            }
+            return carpoolValue == null ? "" : String(carpoolValue);
           }
 
           if (column.participantNumber) {
@@ -2418,6 +2732,54 @@ function renderPricingEditor(event) {
   `;
 }
 
+function renderCarpoolEditor(event) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  const remainingCapacity =
+    event?.carpool?.remainingCapacity == null
+      ? computeRemainingCarpoolCapacity(event)
+      : event.carpool.remainingCapacity;
+
+  return `
+    <div class="editor-card">
+      <div class="section-header">
+        <div>
+          <h3>共乘設定</h3>
+          <p class="field-help">選擇性開啟；關閉時前台不會顯示共乘選項。</p>
+        </div>
+        <label class="inline-checkbox">
+          <input type="checkbox" data-carpool-field="enabled" ${carpool.enabled ? "checked" : ""} />
+          <span>啟用共乘</span>
+        </label>
+      </div>
+      ${
+        carpool.enabled
+          ? `
+            <div class="field-grid two">
+              <div class="field">
+                <label>共乘單價</label>
+                <input class="input" type="number" min="0" step="0.01" value="${escapeHtml(carpool.price ?? "")}" data-carpool-field="price" placeholder="例如 200" />
+              </div>
+              <div class="field">
+                <label>共乘數量上限</label>
+                <input class="input" type="number" min="1" value="${escapeHtml(carpool.capacity ?? "")}" data-carpool-field="capacity" placeholder="留空代表不限名額" />
+                <p class="field-help">${
+                  remainingCapacity == null
+                    ? "目前不限共乘名額。"
+                    : `目前剩餘 ${remainingCapacity} 位共乘名額。`
+                }</p>
+              </div>
+            </div>
+            <div class="field">
+              <label>共乘說明</label>
+              <textarea class="textarea" data-carpool-field="description" placeholder="例如：集合地點、時間、車資包含項目">${escapeHtml(carpool.description)}</textarea>
+            </div>
+          `
+          : `<div class="empty-state"><h4>目前未啟用共乘</h4><p class="muted-text">前台將不會出現共乘選項，也不會計算共乘費用。</p></div>`
+      }
+    </div>
+  `;
+}
+
 function renderAdminEditor() {
   const draft = state.admin.draft;
   if (!draft) {
@@ -2532,6 +2894,7 @@ function renderAdminEditor() {
         </div>
 
         ${renderPricingEditor(draft)}
+        ${renderCarpoolEditor(draft)}
 
         <div class="editor-card">
           <div class="section-header">
@@ -2901,6 +3264,28 @@ function updateDraftPricingField(field, value, checked, shouldRender = false) {
   markDraftDirty(shouldRender);
 }
 
+function updateDraftCarpoolField(field, value, checked, shouldRender = false) {
+  if (!state.admin.draft) {
+    return;
+  }
+
+  const carpool = state.admin.draft.carpool || createCarpoolConfig();
+
+  if (field === "enabled") {
+    carpool.enabled = checked;
+  } else if (field === "price") {
+    carpool.price = normalizeMoneyValue(value);
+  } else if (field === "capacity") {
+    carpool.capacity =
+      value === "" ? null : Math.max(1, Number.parseInt(value, 10) || 0) || null;
+  } else {
+    carpool[field] = String(value || "");
+  }
+
+  state.admin.draft.carpool = normalizeCarpoolConfig(carpool);
+  markDraftDirty(shouldRender);
+}
+
 function updateDraftPageField(pageId, field, value, shouldRender = false) {
   const page = findPage(pageId);
   if (!page) {
@@ -3029,6 +3414,38 @@ function updateRunnerPricingConfirmation(value, shouldRender = false) {
   }
 }
 
+function updateRunnerCarpoolSelection(field, value, checked, shouldRender = false) {
+  const event = getSelectedPublicEvent();
+  const runner = state.public.runner;
+  if (!event || !runner) {
+    return;
+  }
+
+  const current = normalizeRunnerCarpoolSelection(runner.carpoolSelection);
+
+  if (field === "requested") {
+    current.requested = checked;
+    current.quantity = checked ? Math.max(1, current.quantity || 1) : 0;
+  } else if (field === "quantity") {
+    current.requested = true;
+    current.quantity = Math.max(1, Number.parseInt(value, 10) || 1);
+  }
+
+  runner.carpoolSelection = current;
+  runner.errors = {
+    ...runner.errors,
+    __carpool__: "",
+  };
+  runner.reviewErrors = {
+    ...runner.reviewErrors,
+    carpool: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
 function goToPreviousPage() {
   const event = getSelectedPublicEvent();
   const runner = state.public.runner;
@@ -3124,6 +3541,7 @@ async function submitRegistration() {
           (entry) => entry.participantNumber <= Math.max(1, runner.finalParticipantCount || 1),
         ),
         runner.pricingConfirmationValue,
+        normalizeRunnerCarpoolSelection(runner.carpoolSelection),
       );
       runner.submitted = true;
       runner.success = {
@@ -3164,6 +3582,15 @@ async function submitRegistration() {
     }
 
     if (runner.returnToReview) {
+      const carpoolError = validateCarpoolSelection(event, runner);
+      if (carpoolError) {
+        runner.errors = {
+          ...runner.errors,
+          __carpool__: carpoolError,
+        };
+        renderPublicDetail();
+        return;
+      }
       moveRunnerToReviewStage(event, runner);
       renderPublicDetail();
       return;
@@ -3185,6 +3612,15 @@ async function submitRegistration() {
     }
 
     if (runner.returnToReview) {
+      const carpoolError = validateCarpoolSelection(event, runner);
+      if (carpoolError) {
+        runner.errors = {
+          ...runner.errors,
+          __carpool__: carpoolError,
+        };
+        renderPublicDetail();
+        return;
+      }
       moveRunnerToReviewStage(event, runner);
       renderPublicDetail();
       return;
@@ -3202,6 +3638,16 @@ async function submitRegistration() {
       renderPublicDetail();
       return;
     }
+  }
+
+  const carpoolError = validateCarpoolSelection(event, runner);
+  if (carpoolError) {
+    runner.errors = {
+      ...runner.errors,
+      __carpool__: carpoolError,
+    };
+    renderPublicDetail();
+    return;
   }
 
   moveRunnerToReviewStage(event, runner);
@@ -3227,6 +3673,10 @@ function restartRegistration() {
     finalParticipantCount: 1,
     returnToReview: false,
     pricingConfirmationValue: "",
+    carpoolSelection: {
+      requested: false,
+      quantity: 0,
+    },
     reviewErrors: {},
     submitting: false,
     submitted: false,
@@ -3342,6 +3792,16 @@ function applyControlMutation(target, forceRender = false) {
     return;
   }
 
+  if (target.dataset.carpoolField) {
+    updateDraftCarpoolField(
+      target.dataset.carpoolField,
+      target.value,
+      target instanceof HTMLInputElement ? target.checked : false,
+      shouldRender,
+    );
+    return;
+  }
+
   if (target.dataset.optionField && target.dataset.questionId && target.dataset.optionId) {
     updateDraftOptionField(
       target.dataset.questionId,
@@ -3355,6 +3815,16 @@ function applyControlMutation(target, forceRender = false) {
 
   if (target.dataset.publicPricingConfirmation) {
     updateRunnerPricingConfirmation(target.value, shouldRender);
+    return;
+  }
+
+  if (target.dataset.publicCarpoolField) {
+    updateRunnerCarpoolSelection(
+      target.dataset.publicCarpoolField,
+      target.value,
+      target instanceof HTMLInputElement ? target.checked : false,
+      shouldRender,
+    );
     return;
   }
 
@@ -3607,6 +4077,12 @@ document.addEventListener("click", async (event) => {
         jumpToRepeatQuestionFromReview(event, runner, participantNumber);
         renderPublicDetail();
       }
+      return;
+    }
+
+    if (action === "edit-carpool" && event && runner) {
+      jumpToCarpoolFromReview(event, runner);
+      renderPublicDetail();
       return;
     }
 

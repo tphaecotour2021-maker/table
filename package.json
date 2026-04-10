@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check app.js && node --check netlify/functions/admin.mjs && node --check netlify/functions/events.mjs && node --check netlify/functions/register.mjs"
+    "check": "node --check app.js && node --check netlify/functions/admin.mjs && node --check netlify/functions/events.mjs && node --check netlify/functions/register.mjs && node --check netlify/functions/checkout.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "latest"

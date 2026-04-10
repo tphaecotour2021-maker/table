@@ -910,6 +910,69 @@ button:disabled {
   justify-content: flex-end;
 }
 
+.cart-summary-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  border: 1px solid rgba(181, 72, 47, 0.16);
+  border-radius: 20px;
+  background: rgba(255, 248, 241, 0.92);
+  padding: 14px 16px;
+  box-shadow: 0 14px 34px rgba(53, 34, 20, 0.08);
+}
+
+.cart-summary-bar > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.cart-summary-bar span {
+  color: var(--muted);
+}
+
+.event-spec-card,
+.cart-item-card,
+.participant-card {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.78);
+  padding: 16px;
+}
+
+.event-spec-card {
+  margin-top: 18px;
+}
+
+.cart-checkout-shell {
+  display: grid;
+  gap: 16px;
+}
+
+.cart-item-list {
+  display: grid;
+  gap: 12px;
+}
+
+.cart-item-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.participant-card {
+  margin-top: 14px;
+}
+
+.assignment-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
 .login-card {
   padding: 24px;
 }
@@ -978,6 +1041,16 @@ button:disabled {
   .field-grid.two,
   .option-row,
   .logic-row {
+    grid-template-columns: 1fr;
+  }
+
+  .cart-summary-bar,
+  .cart-item-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .assignment-grid {
     grid-template-columns: 1fr;
   }
 

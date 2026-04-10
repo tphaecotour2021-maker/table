@@ -26,6 +26,21 @@ const state = {
   public: {
     events: [],
     selectedEventId: null,
+    modalMode: null,
+    eventSpec: null,
+    cart: {
+      items: [],
+      contact: {
+        name: "",
+        phone: "",
+        email: "",
+        note: "",
+      },
+      participants: [],
+      errors: {},
+      submitting: false,
+      success: null,
+    },
     runner: null,
     loading: true,
     error: "",
@@ -280,6 +295,35 @@ function normalizeSubmissionCarpool(carpool) {
   };
 }
 
+function normalizeSubmissionCart(cart) {
+  if (!cart || typeof cart !== "object") {
+    return null;
+  }
+
+  const participants = Array.isArray(cart?.participants)
+    ? cart.participants.map((participant, index) => ({
+        id: String(participant?.id || `participant_${index + 1}`),
+        name: String(participant?.name || "").trim(),
+        phone: String(participant?.phone || "").trim(),
+        email: String(participant?.email || "").trim(),
+        idNumber: String(participant?.idNumber || "").trim(),
+      }))
+    : [];
+
+  return {
+    orderId: String(cart?.orderId || "").trim(),
+    itemId: String(cart?.itemId || "").trim(),
+    contact: {
+      name: String(cart?.contact?.name || "").trim(),
+      phone: String(cart?.contact?.phone || "").trim(),
+      email: String(cart?.contact?.email || "").trim(),
+      note: String(cart?.contact?.note || "").trim(),
+    },
+    participants,
+    subtotal: normalizeMoneyValue(cart?.subtotal),
+  };
+}
+
 function hasPricingFeatureEnabled(event) {
   return Boolean(event?.pricing?.enabled);
 }
@@ -455,6 +499,7 @@ function normalizeSubmission(submission) {
     answers: submission?.answers && typeof submission.answers === "object" ? submission.answers : {},
     pricing: normalizeSubmissionPricing(submission?.pricing),
     carpool: normalizeSubmissionCarpool(submission?.carpool),
+    cart: normalizeSubmissionCart(submission?.cart),
     repeatedAnswers: Array.isArray(submission?.repeatedAnswers)
       ? submission.repeatedAnswers
           .map((entry, index) => ({
@@ -1019,6 +1064,56 @@ function hasParticipantCountInput(event, answers) {
   return trackedQuestions.some((question) => normalizedAnswers[question.id] !== "");
 }
 
+function buildParticipantCountAnswers(event, participants, contact = {}, assignedParticipants = []) {
+  const normalizedParticipants = Math.max(1, Number.parseInt(participants, 10) || 1);
+  const participantNames = assignedParticipants
+    .map((participant) => participant.name)
+    .filter(Boolean)
+    .join("、");
+  const answers = {};
+  let appliedParticipantCount = false;
+
+  for (const page of event.pages) {
+    for (const question of page.questions) {
+      if (question.countsTowardCapacity && !appliedParticipantCount) {
+        answers[question.id] = String(normalizedParticipants);
+        appliedParticipantCount = true;
+        continue;
+      }
+
+      if (question.countsTowardCapacity) {
+        answers[question.id] = "0";
+        continue;
+      }
+
+      if (question.type === "email") {
+        answers[question.id] = contact.email || "";
+        continue;
+      }
+
+      if (question.type === "phone") {
+        answers[question.id] = contact.phone || "";
+        continue;
+      }
+
+      if (question.type === "idNumber") {
+        answers[question.id] = assignedParticipants[0]?.idNumber || "";
+        continue;
+      }
+
+      const label = question.label || "";
+      if (/姓名|名字|name/i.test(label)) {
+        answers[question.id] = participantNames || contact.name || "";
+        continue;
+      }
+
+      answers[question.id] = question.type === "multiChoice" ? [] : "";
+    }
+  }
+
+  return answers;
+}
+
 function getPricingQuote(event, answers, referenceTime = new Date().toISOString()) {
   const pricing = normalizePricingConfig(event?.pricing);
   if (!pricing.enabled) {
@@ -1098,6 +1193,85 @@ function getPricingQuote(event, answers, referenceTime = new Date().toISOString(
   };
 }
 
+function getPricingQuoteForParticipants(event, participants, referenceTime = new Date().toISOString()) {
+  const pricing = normalizePricingConfig(event?.pricing);
+  if (!pricing.enabled) {
+    return null;
+  }
+
+  const normalizedParticipants = Math.max(1, Number.parseInt(participants, 10) || 1);
+  const candidates = [];
+  const basePrice = pricing.discountPrice ?? pricing.originalPrice;
+
+  if (basePrice != null) {
+    candidates.push({
+      tierKey: pricing.discountPrice != null ? "discount" : "original",
+      tierLabel: pricing.discountPrice != null ? "優惠價" : "原價",
+      unitPrice: basePrice,
+      priority: 1,
+    });
+  }
+
+  if (
+    pricing.groupEnabled &&
+    pricing.groupThreshold != null &&
+    pricing.groupPrice != null &&
+    normalizedParticipants >= pricing.groupThreshold
+  ) {
+    candidates.push({
+      tierKey: "group",
+      tierLabel: `團體價（${pricing.groupThreshold} 人以上）`,
+      unitPrice: pricing.groupPrice,
+      priority: 2,
+    });
+  }
+
+  if (
+    pricing.earlyBirdEnabled &&
+    pricing.earlyBirdDeadline &&
+    pricing.earlyBirdPrice != null &&
+    new Date(referenceTime).valueOf() <= new Date(pricing.earlyBirdDeadline).valueOf()
+  ) {
+    candidates.push({
+      tierKey: "earlyBird",
+      tierLabel: "早鳥價",
+      unitPrice: pricing.earlyBirdPrice,
+      priority: 3,
+    });
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    if (left.unitPrice !== right.unitPrice) {
+      return left.unitPrice - right.unitPrice;
+    }
+    return right.priority - left.priority;
+  });
+
+  const applied = candidates[0];
+  const originalUnitPrice =
+    pricing.originalPrice != null && pricing.originalPrice > applied.unitPrice
+      ? pricing.originalPrice
+      : null;
+
+  return {
+    tierKey: applied.tierKey,
+    tierLabel: applied.tierLabel,
+    unitPrice: applied.unitPrice,
+    originalUnitPrice,
+    totalPrice: roundMoney(applied.unitPrice * normalizedParticipants),
+    participants: normalizedParticipants,
+    confirmationFieldEnabled: pricing.confirmationFieldEnabled,
+    confirmationFieldLabel: pricing.confirmationFieldLabel,
+    confirmationFieldPlaceholder: pricing.confirmationFieldPlaceholder,
+    confirmationFieldRequired: pricing.confirmationFieldRequired,
+    earlyBirdDeadline: pricing.earlyBirdDeadline,
+  };
+}
+
 function normalizeRunnerCarpoolSelection(selection) {
   const requested = Boolean(selection?.requested);
   const quantity = requested ? Math.max(1, Number.parseInt(selection?.quantity, 10) || 1) : 0;
@@ -1142,6 +1316,234 @@ function getCheckoutTotal(event, answers, carpoolSelection) {
     carpoolQuote,
     totalPrice,
   };
+}
+
+function createEventSpec(event) {
+  return {
+    eventId: event.id,
+    quantity: 1,
+    carpoolSelection: {
+      requested: false,
+      quantity: 0,
+    },
+    errors: {},
+  };
+}
+
+function normalizeCartQuantity(value) {
+  return Math.max(1, Number.parseInt(value, 10) || 1);
+}
+
+function createCartParticipant(index = 0) {
+  return {
+    id: createId("participant"),
+    name: "",
+    phone: "",
+    email: "",
+    idNumber: "",
+    assignedItemIds: [],
+    label: `參加者 ${index + 1}`,
+  };
+}
+
+function getCartItems() {
+  return state.public.cart.items || [];
+}
+
+function getCartItemEvent(item) {
+  return state.public.events.find((event) => event.id === item.eventId) || null;
+}
+
+function getCartItemQuote(item) {
+  const event = getCartItemEvent(item);
+  if (!event) {
+    return null;
+  }
+
+  const pricingQuote = getPricingQuoteForParticipants(event, item.quantity);
+  const carpoolQuote = getCarpoolQuote(event, item.carpoolSelection);
+  const totalPrice = roundMoney((pricingQuote?.totalPrice || 0) + (carpoolQuote?.totalPrice || 0));
+
+  return {
+    event,
+    pricingQuote,
+    carpoolQuote,
+    totalPrice,
+  };
+}
+
+function getCartTotal() {
+  return roundMoney(
+    getCartItems().reduce((sum, item) => sum + (getCartItemQuote(item)?.totalPrice || 0), 0),
+  );
+}
+
+function cartRequiresPaymentNote() {
+  return getCartItems().some((item) => {
+    const event = getCartItemEvent(item);
+    const pricing = normalizePricingConfig(event?.pricing);
+    return pricing.enabled && pricing.confirmationFieldEnabled && pricing.confirmationFieldRequired;
+  });
+}
+
+function getCartItemAssignedParticipants(itemId) {
+  return (state.public.cart.participants || []).filter((participant) =>
+    (participant.assignedItemIds || []).includes(itemId),
+  );
+}
+
+function getRequiredCartParticipantCount() {
+  const quantities = getCartItems().map((item) => normalizeCartQuantity(item.quantity));
+  return quantities.length ? Math.max(...quantities) : 1;
+}
+
+function normalizeCartParticipant(participant, index = 0) {
+  return {
+    id: String(participant?.id || createId("participant")),
+    name: String(participant?.name || "").trim(),
+    phone: String(participant?.phone || "").trim(),
+    email: String(participant?.email || "").trim(),
+    idNumber: String(participant?.idNumber || "").trim().toUpperCase().replace(/[\s-]/g, ""),
+    assignedItemIds: Array.isArray(participant?.assignedItemIds)
+      ? participant.assignedItemIds.map((value) => String(value))
+      : [],
+    label: String(participant?.label || `參加者 ${index + 1}`),
+  };
+}
+
+function ensureCartParticipantRows({ autoAssign = false } = {}) {
+  const validItemIds = new Set(getCartItems().map((item) => item.id));
+  const requiredCount = getRequiredCartParticipantCount();
+  const participants = (state.public.cart.participants || []).map((participant, index) => {
+    const normalized = normalizeCartParticipant(participant, index);
+    normalized.assignedItemIds = normalized.assignedItemIds.filter((itemId) => validItemIds.has(itemId));
+    return normalized;
+  });
+
+  while (participants.length < requiredCount) {
+    participants.push(createCartParticipant(participants.length));
+  }
+
+  if (autoAssign) {
+    for (const item of getCartItems()) {
+      let assigned = participants.filter((participant) =>
+        participant.assignedItemIds.includes(item.id),
+      );
+
+      if (assigned.length > item.quantity) {
+        for (const participant of assigned.slice(item.quantity)) {
+          participant.assignedItemIds = participant.assignedItemIds.filter((id) => id !== item.id);
+        }
+      }
+
+      assigned = participants.filter((participant) => participant.assignedItemIds.includes(item.id));
+      for (const participant of participants) {
+        if (assigned.length >= item.quantity) {
+          break;
+        }
+        if (!participant.assignedItemIds.includes(item.id)) {
+          participant.assignedItemIds.push(item.id);
+          assigned.push(participant);
+        }
+      }
+    }
+  }
+
+  state.public.cart.participants = participants;
+}
+
+function validateEventSpec(event, spec) {
+  const quantity = normalizeCartQuantity(spec?.quantity);
+  const errors = {};
+
+  if (event.remainingCapacity != null && quantity > event.remainingCapacity) {
+    errors.quantity = `活動名額不足，目前只剩 ${event.remainingCapacity} 人。`;
+  }
+
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  const carpoolSelection = normalizeRunnerCarpoolSelection(spec?.carpoolSelection);
+  if (carpool.enabled && carpoolSelection.requested) {
+    if (carpoolSelection.quantity > quantity) {
+      errors.carpool = `共乘人數不能超過活動人數 ${quantity} 人。`;
+    }
+
+    const remaining = event?.carpool?.remainingCapacity == null
+      ? computeRemainingCarpoolCapacity(event)
+      : event.carpool.remainingCapacity;
+    if (remaining != null && carpoolSelection.quantity > remaining) {
+      errors.carpool = `共乘名額不足，目前只剩 ${remaining} 位。`;
+    }
+  }
+
+  return errors;
+}
+
+function validateCartCheckout() {
+  const errors = {};
+  const contact = state.public.cart.contact || {};
+  const items = getCartItems();
+
+  if (items.length === 0) {
+    errors.cart = "購物車目前是空的。";
+  }
+
+  if (!String(contact.name || "").trim()) {
+    errors.contactName = "請填寫聯絡人姓名。";
+  }
+
+  if (!String(contact.phone || "").trim()) {
+    errors.contactPhone = "請填寫聯絡電話。";
+  } else if (!/^[0-9+\-()#\s]{6,}$/.test(String(contact.phone))) {
+    errors.contactPhone = "請填寫有效的聯絡電話。";
+  }
+
+  if (!String(contact.email || "").trim()) {
+    errors.contactEmail = "請填寫聯絡 Email。";
+  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(contact.email))) {
+    errors.contactEmail = "請填寫有效的 Email。";
+  }
+
+  if (cartRequiresPaymentNote() && !String(contact.note || "").trim()) {
+    errors.contactNote = "請填寫備註 / 付款確認資訊。";
+  }
+
+  ensureCartParticipantRows();
+  const assignedParticipantIds = new Set();
+
+  for (const item of items) {
+    const assigned = getCartItemAssignedParticipants(item.id);
+    if (assigned.length !== item.quantity) {
+      errors[`assignment_${item.id}`] = `${getCartItemEvent(item)?.title || "活動"} 需要勾選 ${item.quantity} 位參加者，目前是 ${assigned.length} 位。`;
+    }
+
+    for (const participant of assigned) {
+      assignedParticipantIds.add(participant.id);
+    }
+  }
+
+  for (const participant of state.public.cart.participants) {
+    if (!assignedParticipantIds.has(participant.id)) {
+      continue;
+    }
+
+    if (!participant.name) {
+      errors[`participant_${participant.id}_name`] = "請填寫參加者姓名。";
+    }
+
+    if (participant.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(participant.email)) {
+      errors[`participant_${participant.id}_email`] = "Email 格式不正確。";
+    }
+
+    if (participant.phone && !/^[0-9+\-()#\s]{6,}$/.test(participant.phone)) {
+      errors[`participant_${participant.id}_phone`] = "電話格式不正確。";
+    }
+
+    if (participant.idNumber && !/^[A-Z][A-Z0-9]\d{8}$/.test(participant.idNumber)) {
+      errors[`participant_${participant.id}_idNumber`] = "身分證字號需要是 10 碼。";
+    }
+  }
+
+  return errors;
 }
 
 function validateCarpoolSelection(event, runner) {
@@ -1278,6 +1680,376 @@ function renderCheckoutTotal(event, runner) {
         }
       </div>
     </section>
+  `;
+}
+
+function renderCartItemTotal(item) {
+  const quote = getCartItemQuote(item);
+  if (!quote) {
+    return "";
+  }
+
+  return `
+    <div class="meta-row" style="margin-top: 10px;">
+      <span class="meta-pill">${item.quantity} 人</span>
+      ${
+        quote.pricingQuote
+          ? `<span class="meta-pill">活動 ${escapeHtml(formatMoney(quote.pricingQuote.totalPrice))}</span>`
+          : ""
+      }
+      ${
+        quote.carpoolQuote
+          ? `<span class="meta-pill">共乘 ${escapeHtml(formatMoney(quote.carpoolQuote.totalPrice))}</span>`
+          : ""
+      }
+      ${quote.totalPrice ? `<span class="meta-pill">小計 ${escapeHtml(formatMoney(quote.totalPrice))}</span>` : ""}
+    </div>
+  `;
+}
+
+function renderEventSpecCarpoolSelector(event, spec) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  if (!carpool.enabled) {
+    return "";
+  }
+
+  const selection = normalizeRunnerCarpoolSelection(spec?.carpoolSelection);
+  const quantity = normalizeCartQuantity(spec?.quantity);
+  const remaining = event?.carpool?.remainingCapacity == null
+    ? computeRemainingCarpoolCapacity(event)
+    : event.carpool.remainingCapacity;
+  const maxQuantity = Math.max(1, Math.min(quantity, remaining ?? quantity));
+  const quote = getCarpoolQuote(event, selection);
+  const error = spec?.errors?.carpool || "";
+
+  return `
+    <section class="price-card price-card-compact">
+      <div class="split-row review-section-header">
+        <div>
+          <h4>共乘</h4>
+          ${carpool.description ? `<p class="field-help">${nl2br(carpool.description)}</p>` : ""}
+        </div>
+        ${carpool.price != null ? `<div class="price-total-copy">${escapeHtml(formatMoney(carpool.price))} / 位</div>` : ""}
+      </div>
+      <div class="meta-row" style="margin-top: 12px;">
+        ${
+          remaining == null
+            ? `<span class="meta-pill">不限名額</span>`
+            : `<span class="meta-pill">剩餘 ${remaining} 位</span>`
+        }
+        ${quote ? `<span class="meta-pill">共乘小計 ${escapeHtml(formatMoney(quote.totalPrice))}</span>` : ""}
+      </div>
+      <label class="inline-checkbox" style="margin-top: 14px;">
+        <input type="checkbox" data-public-spec-carpool-field="requested" ${selection.requested ? "checked" : ""} />
+        <span>我需要共乘</span>
+      </label>
+      ${
+        selection.requested
+          ? `
+            <div class="field" style="margin-top: 12px;">
+              <label>共乘人數</label>
+              <input class="input" type="number" min="1" max="${maxQuantity}" value="${escapeHtml(selection.quantity || 1)}" data-public-spec-carpool-field="quantity" />
+            </div>
+          `
+          : ""
+      }
+      ${error ? `<div class="question-error">${escapeHtml(error)}</div>` : ""}
+    </section>
+  `;
+}
+
+function renderEventCartDetail(event) {
+  const spec = state.public.eventSpec?.eventId === event.id
+    ? state.public.eventSpec
+    : createEventSpec(event);
+  state.public.eventSpec = spec;
+
+  const isFull = event.remainingCapacity === 0;
+  const pricingQuote = getPricingQuoteForParticipants(event, spec.quantity);
+  const carpoolQuote = getCarpoolQuote(event, spec.carpoolSelection);
+  const totalPrice = roundMoney((pricingQuote?.totalPrice || 0) + (carpoolQuote?.totalPrice || 0));
+
+  dom.publicDetail.innerHTML = `
+    <div class="registration-shell">
+      <div class="registration-cover">
+        ${event.coverImage ? `<img data-image-role="public-detail" data-event-id="${event.id}" alt="${escapeHtml(event.title)} 封面" />` : ""}
+      </div>
+      <div class="chip-row">
+        <span class="status-pill ${isFull ? "full" : "live"}">${isFull ? "名額已滿" : "選擇規格"}</span>
+        ${
+          event.remainingCapacity == null
+            ? `<span class="meta-pill">不限名額</span>`
+            : `<span class="meta-pill">剩餘 ${event.remainingCapacity} 人</span>`
+        }
+      </div>
+      <h3 style="margin-top: 14px;">${escapeHtml(event.title)}</h3>
+      ${event.description ? `<p class="event-description-inline">${nl2br(event.description)}</p>` : ""}
+      ${
+        isFull
+          ? `<div class="empty-state" style="margin-top: 20px;"><h3>這個活動目前已額滿</h3></div>`
+          : `
+            <section class="event-spec-card">
+              <div class="field">
+                <label>參加人數</label>
+                <input class="input" type="number" min="1" value="${escapeHtml(spec.quantity)}" data-public-spec-field="quantity" />
+                ${spec.errors?.quantity ? `<div class="question-error">${escapeHtml(spec.errors.quantity)}</div>` : ""}
+              </div>
+              ${
+                pricingQuote
+                  ? `
+                    <div class="price-line" style="margin-top: 12px;">
+                      ${
+                        pricingQuote.originalUnitPrice != null
+                          ? `<span class="price-original">${escapeHtml(formatMoney(pricingQuote.originalUnitPrice))} / 人</span>`
+                          : ""
+                      }
+                      <span class="price-current">${escapeHtml(pricingQuote.tierLabel)} ${escapeHtml(formatMoney(pricingQuote.unitPrice))} / 人</span>
+                    </div>
+                  `
+                  : ""
+              }
+            </section>
+            ${renderEventSpecCarpoolSelector(event, spec)}
+            ${
+              pricingQuote || carpoolQuote
+                ? `
+                  <section class="price-card">
+                    <div class="split-row review-section-header">
+                      <div>
+                        <h4>加入購物車小計</h4>
+                        <p class="field-help">結帳時會再填寫聯絡人與參加者資料。</p>
+                      </div>
+                      <div class="price-total-copy">${escapeHtml(formatMoney(totalPrice))}</div>
+                    </div>
+                    <div class="meta-row" style="margin-top: 12px;">
+                      ${pricingQuote ? `<span class="meta-pill">活動 ${escapeHtml(formatMoney(pricingQuote.totalPrice))}</span>` : ""}
+                      ${carpoolQuote ? `<span class="meta-pill">共乘 ${escapeHtml(formatMoney(carpoolQuote.totalPrice))}</span>` : ""}
+                    </div>
+                  </section>
+                `
+                : ""
+            }
+          `
+      }
+      <div class="action-row" style="margin-top: 24px;">
+        <button class="primary-button" type="button" data-public-action="add-to-cart" ${isFull ? "disabled" : ""}>加入購物車</button>
+        <button class="secondary-button" type="button" data-public-action="open-cart">查看購物車（${getCartItems().length}）</button>
+        <button class="text-button" type="button" data-public-action="close">關閉</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderCartSummaryBar() {
+  const itemCount = getCartItems().length;
+  if (itemCount === 0) {
+    return "";
+  }
+
+  const totalParticipants = getCartItems().reduce((sum, item) => sum + item.quantity, 0);
+  const totalPrice = getCartTotal();
+
+  return `
+    <div class="cart-summary-bar">
+      <div>
+        <strong>購物車</strong>
+        <span>${itemCount} 個活動，規格人數共 ${totalParticipants} 人</span>
+      </div>
+      <div class="action-row">
+        ${totalPrice ? `<span class="price-total-copy">${escapeHtml(formatMoney(totalPrice))}</span>` : ""}
+        <button class="primary-button" type="button" data-public-action="open-cart">前往結帳</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderCartItemList() {
+  if (getCartItems().length === 0) {
+    return `<div class="empty-state"><h3>購物車目前是空的</h3><p class="muted-text">先從活動卡選擇規格並加入購物車。</p></div>`;
+  }
+
+  return `
+    <div class="cart-item-list">
+      ${getCartItems()
+        .map((item) => {
+          const event = getCartItemEvent(item);
+          const assignedCount = getCartItemAssignedParticipants(item.id).length;
+          return `
+            <article class="cart-item-card">
+              <div>
+                <h4>${escapeHtml(event?.title || "活動已不存在")}</h4>
+                ${renderCartItemTotal(item)}
+                <div class="meta-row" style="margin-top: 10px;">
+                  <span class="meta-pill">已勾選 ${assignedCount} / ${item.quantity} 位</span>
+                </div>
+                ${
+                  state.public.cart.errors?.[`assignment_${item.id}`]
+                    ? `<div class="question-error">${escapeHtml(state.public.cart.errors[`assignment_${item.id}`])}</div>`
+                    : ""
+                }
+              </div>
+              <button class="text-button" type="button" data-public-action="remove-cart-item" data-cart-item-id="${item.id}">移除</button>
+            </article>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderCartParticipantEditor(participant, index) {
+  const errors = state.public.cart.errors || {};
+  return `
+    <section class="participant-card">
+      <div class="split-row review-section-header">
+        <h4>參加者 ${index + 1}</h4>
+        ${
+          state.public.cart.participants.length > getRequiredCartParticipantCount()
+            ? `<button class="text-button" type="button" data-public-action="remove-checkout-participant" data-participant-id="${participant.id}">移除</button>`
+            : ""
+        }
+      </div>
+      <div class="field-grid two">
+        <div class="field">
+          <label>姓名</label>
+          <input class="input" type="text" value="${escapeHtml(participant.name)}" data-cart-participant-id="${participant.id}" data-cart-participant-field="name" />
+          ${errors[`participant_${participant.id}_name`] ? `<div class="question-error">${escapeHtml(errors[`participant_${participant.id}_name`])}</div>` : ""}
+        </div>
+        <div class="field">
+          <label>身分證字號</label>
+          <input class="input" type="text" maxlength="10" autocapitalize="characters" spellcheck="false" value="${escapeHtml(participant.idNumber)}" data-cart-participant-id="${participant.id}" data-cart-participant-field="idNumber" />
+          ${errors[`participant_${participant.id}_idNumber`] ? `<div class="question-error">${escapeHtml(errors[`participant_${participant.id}_idNumber`])}</div>` : ""}
+        </div>
+      </div>
+      <div class="field-grid two">
+        <div class="field">
+          <label>電話</label>
+          <input class="input" type="tel" value="${escapeHtml(participant.phone)}" data-cart-participant-id="${participant.id}" data-cart-participant-field="phone" placeholder="可留空，留空時以聯絡人電話為主" />
+          ${errors[`participant_${participant.id}_phone`] ? `<div class="question-error">${escapeHtml(errors[`participant_${participant.id}_phone`])}</div>` : ""}
+        </div>
+        <div class="field">
+          <label>Email</label>
+          <input class="input" type="email" value="${escapeHtml(participant.email)}" data-cart-participant-id="${participant.id}" data-cart-participant-field="email" placeholder="可留空，留空時以聯絡人 Email 為主" />
+          ${errors[`participant_${participant.id}_email`] ? `<div class="question-error">${escapeHtml(errors[`participant_${participant.id}_email`])}</div>` : ""}
+        </div>
+      </div>
+      <div class="assignment-grid">
+        ${getCartItems()
+          .map((item) => {
+            const event = getCartItemEvent(item);
+            const checked = participant.assignedItemIds.includes(item.id);
+            return `
+              <label class="option-chip ${checked ? "active" : ""}">
+                <input type="checkbox" data-cart-assignment-item-id="${item.id}" data-cart-participant-id="${participant.id}" ${checked ? "checked" : ""} />
+                <span>${escapeHtml(event?.title || "活動已不存在")}</span>
+              </label>
+            `;
+          })
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderCartCheckout() {
+  ensureCartParticipantRows();
+  const cart = state.public.cart;
+  const errors = cart.errors || {};
+
+  if (cart.success) {
+    dom.publicDetail.innerHTML = `
+      <div class="registration-shell">
+        <div class="empty-state">
+          <h3>結帳完成</h3>
+          <p class="muted-text">訂單編號：${escapeHtml(cart.success.orderId)}</p>
+          ${cart.success.totalPrice ? `<p class="price-total-copy" style="margin-top: 10px;">${escapeHtml(formatMoney(cart.success.totalPrice))}</p>` : ""}
+        </div>
+        <div class="action-row" style="margin-top: 24px;">
+          <button class="primary-button" type="button" data-public-action="checkout-reset">繼續選活動</button>
+          <button class="text-button" type="button" data-public-action="close">關閉</button>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  dom.publicDetail.innerHTML = `
+    <div class="registration-shell cart-checkout-shell">
+      <div class="chip-row">
+        <span class="status-pill live">購物車結帳</span>
+        <span class="meta-pill">${getCartItems().length} 個活動</span>
+      </div>
+      <h3 style="margin-top: 14px;">確認購物車</h3>
+      ${errors.cart ? `<div class="question-error">${escapeHtml(errors.cart)}</div>` : ""}
+      ${renderCartItemList()}
+
+      ${
+        getCartItems().length
+          ? `
+            <section class="review-section-card">
+              <div class="split-row review-section-header">
+                <div>
+                  <h4>聯絡人資料</h4>
+                  <p class="field-help">這是整筆訂單的主要聯絡資訊。</p>
+                </div>
+              </div>
+              <div class="field-grid two">
+                <div class="field">
+                  <label>聯絡人姓名</label>
+                  <input class="input" type="text" value="${escapeHtml(cart.contact.name)}" data-cart-contact-field="name" />
+                  ${errors.contactName ? `<div class="question-error">${escapeHtml(errors.contactName)}</div>` : ""}
+                </div>
+                <div class="field">
+                  <label>聯絡電話</label>
+                  <input class="input" type="tel" value="${escapeHtml(cart.contact.phone)}" data-cart-contact-field="phone" />
+                  ${errors.contactPhone ? `<div class="question-error">${escapeHtml(errors.contactPhone)}</div>` : ""}
+                </div>
+              </div>
+              <div class="field-grid two">
+                <div class="field">
+                  <label>聯絡 Email</label>
+                  <input class="input" type="email" value="${escapeHtml(cart.contact.email)}" data-cart-contact-field="email" />
+                  ${errors.contactEmail ? `<div class="question-error">${escapeHtml(errors.contactEmail)}</div>` : ""}
+                </div>
+                <div class="field">
+                  <label>備註 / 付款確認資訊${cartRequiresPaymentNote() ? " *" : ""}</label>
+                  <input class="input" type="text" value="${escapeHtml(cart.contact.note)}" data-cart-contact-field="note" placeholder="例如匯款後五碼、飲食備註等" />
+                  ${errors.contactNote ? `<div class="question-error">${escapeHtml(errors.contactNote)}</div>` : ""}
+                </div>
+              </div>
+            </section>
+
+            <section class="review-section-card">
+              <div class="split-row review-section-header">
+                <div>
+                  <h4>參加者與活動分配</h4>
+                  <p class="field-help">每位參加者可以勾選多個活動；每個活動勾選人數需等於購物車規格人數。</p>
+                </div>
+                <button class="secondary-button" type="button" data-public-action="add-checkout-participant">新增參加者</button>
+              </div>
+              ${cart.participants.map((participant, index) => renderCartParticipantEditor(participant, index)).join("")}
+            </section>
+
+            <section class="price-card">
+              <div class="split-row review-section-header">
+                <div>
+                  <h4>訂單總計</h4>
+                  <p class="field-help">包含購物車內活動費用與共乘費用。</p>
+                </div>
+                <div class="price-total-copy">${escapeHtml(formatMoney(getCartTotal()))}</div>
+              </div>
+            </section>
+          `
+          : ""
+      }
+
+      <div class="action-row" style="margin-top: 24px;">
+        <button class="primary-button" type="button" data-public-action="checkout-submit" ${cart.submitting || getCartItems().length === 0 ? "disabled" : ""}>
+          ${cart.submitting ? "送出中..." : "送出整筆訂單"}
+        </button>
+        <button class="secondary-button" type="button" data-public-action="close">繼續選活動</button>
+      </div>
+    </div>
   `;
 }
 
@@ -1487,6 +2259,17 @@ const api = {
       }),
     });
   },
+
+  async checkoutCart(items, contact, participants) {
+    return requestRemote("checkout", {
+      method: "POST",
+      body: JSON.stringify({
+        items,
+        contact,
+        participants,
+      }),
+    });
+  },
 };
 
 function setStorageSummaryFromAdmin(payload) {
@@ -1546,8 +2329,15 @@ function ensureRunnerForEvent(eventId) {
 }
 
 function selectPublicEvent(eventId) {
+  const event = state.public.events.find((entry) => entry.id === eventId);
+  if (!event) {
+    return;
+  }
+
   state.public.selectedEventId = eventId;
-  ensureRunnerForEvent(eventId);
+  state.public.modalMode = "event";
+  state.public.eventSpec = createEventSpec(event);
+  state.public.runner = null;
   dom.publicOverlay.classList.remove("hidden");
   dom.publicOverlay.setAttribute("aria-hidden", "false");
   renderPublic();
@@ -1555,9 +2345,22 @@ function selectPublicEvent(eventId) {
 
 function closePublicEvent() {
   state.public.selectedEventId = null;
+  state.public.modalMode = null;
+  state.public.eventSpec = null;
   state.public.runner = null;
   dom.publicOverlay.classList.add("hidden");
   dom.publicOverlay.setAttribute("aria-hidden", "true");
+  renderPublic();
+}
+
+function openCartCheckout() {
+  state.public.selectedEventId = null;
+  state.public.modalMode = "cart";
+  state.public.eventSpec = null;
+  state.public.cart.errors = {};
+  ensureCartParticipantRows({ autoAssign: true });
+  dom.publicOverlay.classList.remove("hidden");
+  dom.publicOverlay.setAttribute("aria-hidden", "false");
   renderPublic();
 }
 
@@ -1627,12 +2430,14 @@ function renderEventList() {
     return;
   }
 
-  dom.eventList.innerHTML = state.public.events
+  dom.eventList.innerHTML = `
+    ${renderCartSummaryBar()}
+    ${state.public.events
     .map((event) => {
       const isSelected = event.id === state.public.selectedEventId;
       const remaining = event.remainingCapacity;
       const isFull = remaining === 0;
-      const actionLabel = isFull ? "查看活動" : "立即報名";
+      const actionLabel = isFull ? "查看活動" : "選擇規格";
 
       return `
         <article class="event-card ${isSelected ? "selected" : ""}" data-event-action="open" data-event-id="${event.id}">
@@ -1654,14 +2459,15 @@ function renderEventList() {
             ${event.description ? `<p class="event-description">${escapeHtml(event.description)}</p>` : ""}
             <div class="action-row event-card-footer">
               <button class="primary-button event-card-button" type="button" data-event-action="open" data-event-id="${event.id}">
-                ${isSelected ? "開啟報名" : actionLabel}
+                ${isSelected ? "開啟活動" : actionLabel}
               </button>
             </div>
           </div>
         </article>
       `;
     })
-    .join("");
+    .join("")}
+  `;
 }
 
 function renderInputField(question, value, error) {
@@ -1753,10 +2559,20 @@ function renderInputField(question, value, error) {
 }
 
 function renderPublicDetail() {
+  if (state.public.modalMode === "cart") {
+    renderCartCheckout();
+    return;
+  }
+
   const event = getSelectedPublicEvent();
 
   if (!event) {
     dom.publicDetail.innerHTML = "";
+    return;
+  }
+
+  if (state.public.modalMode === "event") {
+    renderEventCartDetail(event);
     return;
   }
 
@@ -2461,7 +3277,63 @@ function getSubmissionColumns(event) {
     );
   }
 
-  return [...baseColumns, ...repeatedColumns, ...pricingColumns, ...carpoolColumns];
+  const cartColumns = [];
+  const hasCartData = (event.submissions || []).some((submission) => submission.cart);
+  if (hasCartData) {
+    cartColumns.push(
+      { kind: "cart", field: "orderId", header: "訂單編號" },
+      { kind: "cart", field: "contactName", header: "聯絡人" },
+      { kind: "cart", field: "contactPhone", header: "聯絡電話" },
+      { kind: "cart", field: "contactEmail", header: "聯絡 Email" },
+      { kind: "cart", field: "participants", header: "參加者" },
+    );
+  }
+
+  return [...cartColumns, ...baseColumns, ...repeatedColumns, ...pricingColumns, ...carpoolColumns];
+}
+
+function formatCartParticipants(participants) {
+  return (participants || [])
+    .map((participant) => {
+      const details = [
+        participant.name,
+        participant.idNumber ? `身分證 ${participant.idNumber}` : "",
+        participant.phone ? `電話 ${participant.phone}` : "",
+        participant.email ? `Email ${participant.email}` : "",
+      ].filter(Boolean);
+      return details.join(" / ");
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function getCartSubmissionValue(submission, field) {
+  const cart = submission.cart;
+  if (!cart) {
+    return "";
+  }
+
+  if (field === "orderId") {
+    return cart.orderId || "";
+  }
+
+  if (field === "contactName") {
+    return cart.contact?.name || "";
+  }
+
+  if (field === "contactPhone") {
+    return cart.contact?.phone || "";
+  }
+
+  if (field === "contactEmail") {
+    return cart.contact?.email || "";
+  }
+
+  if (field === "participants") {
+    return formatCartParticipants(cart.participants || []);
+  }
+
+  return "";
 }
 
 function formatSubmissionAnswer(question, answer) {
@@ -2506,6 +3378,10 @@ function getSubmissionRows(event) {
         totalParticipants: submission.totalParticipants,
         visitedPages,
         answers: columns.map((column) => {
+          if (column.kind === "cart") {
+            return getCartSubmissionValue(submission, column.field);
+          }
+
           if (column.kind === "pricing") {
             const pricingValue = submission.pricing?.[column.field];
             if (column.field === "unitPrice" || column.field === "originalUnitPrice" || column.field === "totalPrice") {
@@ -2642,6 +3518,133 @@ function exportSubmissionsToExcel() {
   link.remove();
   URL.revokeObjectURL(url);
   showToast("報名資料已匯出。");
+}
+
+function hasAnySubmissions(events = state.admin.events) {
+  return (events || []).some((event) => normalizeEvent(event).submissions.length > 0);
+}
+
+function getSubmissionAnswerSummary(event, submission) {
+  const { columns } = getSubmissionRows(event);
+  return columns
+    .filter((column) => !["pricing", "carpool", "cart"].includes(column.kind))
+    .map((column) => {
+      let value = "";
+      if (column.participantNumber) {
+        const repeatedEntry = (submission.repeatedAnswers || []).find(
+          (entry) => entry.participantNumber === column.participantNumber,
+        );
+        value = formatSubmissionAnswer(column.question, repeatedEntry?.answers?.[column.question.id]);
+      } else {
+        value = formatSubmissionAnswer(column.question, submission.answers?.[column.question.id]);
+      }
+      return value ? `${column.header}：${value}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function exportAllSubmissionsToExcel() {
+  const events = (state.admin.events || []).map((event) => normalizeEvent(event));
+  const rows = events.flatMap((event) =>
+    [...(event.submissions || [])]
+      .sort((left, right) => String(right.submittedAt).localeCompare(String(left.submittedAt)))
+      .map((submission) => {
+        const activityTotal = submission.pricing?.totalPrice || 0;
+        const carpoolTotal = submission.carpool?.totalPrice || 0;
+        const total = activityTotal + carpoolTotal;
+        return {
+          eventTitle: event.title,
+          orderId: submission.cart?.orderId || "",
+          submittedAt: formatDate(submission.submittedAt),
+          totalParticipants: submission.totalParticipants,
+          contactName: submission.cart?.contact?.name || "",
+          contactPhone: submission.cart?.contact?.phone || "",
+          contactEmail: submission.cart?.contact?.email || "",
+          participants: formatCartParticipants(submission.cart?.participants || []),
+          pricingTier: submission.pricing?.tierLabel || "",
+          activityTotal: activityTotal ? formatMoney(activityTotal) : "",
+          carpoolQuantity: submission.carpool?.quantity || "",
+          carpoolTotal: carpoolTotal ? formatMoney(carpoolTotal) : "",
+          total: total ? formatMoney(total) : "",
+          answers: getSubmissionAnswerSummary(event, submission),
+        };
+      }),
+  );
+
+  if (rows.length === 0) {
+    showToast("目前沒有可匯出的報名資料。");
+    return;
+  }
+
+  const headers = [
+    "活動名稱",
+    "訂單編號",
+    "送出時間",
+    "報名人數",
+    "聯絡人",
+    "聯絡電話",
+    "聯絡 Email",
+    "參加者",
+    "價格方案",
+    "活動費用",
+    "共乘人數",
+    "共乘費用",
+    "總計",
+    "表單答案",
+  ];
+  const html = `
+    <!DOCTYPE html>
+    <html lang="zh-Hant">
+      <head>
+        <meta charset="UTF-8" />
+      </head>
+      <body>
+        <table border="1">
+          <thead>
+            <tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr>
+          </thead>
+          <tbody>
+            ${rows
+              .map(
+                (row) => `
+                  <tr>
+                    <td>${escapeHtml(row.eventTitle)}</td>
+                    <td>${escapeHtml(row.orderId || "-")}</td>
+                    <td>${escapeHtml(row.submittedAt)}</td>
+                    <td>${row.totalParticipants}</td>
+                    <td>${escapeHtml(row.contactName || "-")}</td>
+                    <td>${escapeHtml(row.contactPhone || "-")}</td>
+                    <td>${escapeHtml(row.contactEmail || "-")}</td>
+                    <td>${nl2br(row.participants || "-")}</td>
+                    <td>${escapeHtml(row.pricingTier || "-")}</td>
+                    <td>${escapeHtml(row.activityTotal || "-")}</td>
+                    <td>${escapeHtml(row.carpoolQuantity || "-")}</td>
+                    <td>${escapeHtml(row.carpoolTotal || "-")}</td>
+                    <td>${escapeHtml(row.total || "-")}</td>
+                    <td>${nl2br(row.answers || "-")}</td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </body>
+    </html>
+  `;
+
+  const blob = new Blob([`\ufeff${html}`], {
+    type: "application/vnd.ms-excel;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "全部活動-報名資料.xls";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showToast("全部活動報名資料已匯出。");
 }
 
 function renderPricingEditor(event) {
@@ -2815,6 +3818,11 @@ function renderAdminEditor() {
               <button class="secondary-button" type="button" data-admin-action="save-event" ${state.admin.saving ? "disabled" : ""}>
                 ${state.admin.saving ? "儲存中..." : "儲存"}
               </button>
+              ${
+                hasAnySubmissions()
+                  ? `<button class="secondary-button" type="button" data-admin-action="export-all-submissions">匯出全部 Excel</button>`
+                  : ""
+              }
               <button class="secondary-button" type="button" data-admin-action="duplicate-event">複製副本</button>
               <button class="secondary-button" type="button" data-admin-action="new-event">新增活動</button>
               <button class="danger-button" type="button" data-admin-action="delete-event" ${state.admin.deleting ? "disabled" : ""}>
@@ -3284,6 +4292,251 @@ function updateDraftCarpoolField(field, value, checked, shouldRender = false) {
 
   state.admin.draft.carpool = normalizeCarpoolConfig(carpool);
   markDraftDirty(shouldRender);
+}
+
+function updateEventSpecField(field, value, shouldRender = false) {
+  const event = getSelectedPublicEvent();
+  if (!event || !state.public.eventSpec) {
+    return;
+  }
+
+  if (field === "quantity") {
+    const quantity = normalizeCartQuantity(value);
+    state.public.eventSpec.quantity = quantity;
+    const currentCarpool = normalizeRunnerCarpoolSelection(state.public.eventSpec.carpoolSelection);
+    if (currentCarpool.requested && currentCarpool.quantity > quantity) {
+      currentCarpool.quantity = quantity;
+    }
+    state.public.eventSpec.carpoolSelection = currentCarpool;
+  }
+
+  state.public.eventSpec.errors = {
+    ...state.public.eventSpec.errors,
+    [field]: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
+function updateEventSpecCarpoolSelection(field, value, checked, shouldRender = false) {
+  const event = getSelectedPublicEvent();
+  if (!event || !state.public.eventSpec) {
+    return;
+  }
+
+  const current = normalizeRunnerCarpoolSelection(state.public.eventSpec.carpoolSelection);
+
+  if (field === "requested") {
+    current.requested = checked;
+    current.quantity = checked ? Math.max(1, Math.min(current.quantity || 1, state.public.eventSpec.quantity)) : 0;
+  } else if (field === "quantity") {
+    current.requested = true;
+    current.quantity = Math.max(1, Number.parseInt(value, 10) || 1);
+  }
+
+  state.public.eventSpec.carpoolSelection = current;
+  state.public.eventSpec.errors = {
+    ...state.public.eventSpec.errors,
+    carpool: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
+function addSelectedEventToCart() {
+  const event = getSelectedPublicEvent();
+  const spec = state.public.eventSpec;
+  if (!event || !spec) {
+    return;
+  }
+
+  spec.quantity = normalizeCartQuantity(spec.quantity);
+  spec.carpoolSelection = normalizeRunnerCarpoolSelection(spec.carpoolSelection);
+  spec.errors = validateEventSpec(event, spec);
+
+  if (Object.keys(spec.errors).length) {
+    renderPublicDetail();
+    return;
+  }
+
+  const existing = state.public.cart.items.find((item) => item.eventId === event.id);
+  if (existing) {
+    existing.quantity = spec.quantity;
+    existing.carpoolSelection = spec.carpoolSelection;
+  } else {
+    state.public.cart.items.push({
+      id: createId("cart_item"),
+      eventId: event.id,
+      quantity: spec.quantity,
+      carpoolSelection: spec.carpoolSelection,
+    });
+  }
+
+  state.public.cart.success = null;
+  ensureCartParticipantRows({ autoAssign: true });
+  showToast(existing ? "已更新購物車規格。" : "已加入購物車。");
+  openCartCheckout();
+}
+
+function removeCartItem(itemId) {
+  state.public.cart.items = getCartItems().filter((item) => item.id !== itemId);
+  for (const participant of state.public.cart.participants) {
+    participant.assignedItemIds = (participant.assignedItemIds || []).filter((id) => id !== itemId);
+  }
+  state.public.cart.errors = {};
+  ensureCartParticipantRows({ autoAssign: true });
+  renderPublic();
+}
+
+function updateCartContactField(field, value, shouldRender = false) {
+  state.public.cart.contact = {
+    ...state.public.cart.contact,
+    [field]: String(value || ""),
+  };
+  state.public.cart.errors = {
+    ...state.public.cart.errors,
+    [`contact${field.charAt(0).toUpperCase()}${field.slice(1)}`]: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
+function updateCartParticipantField(participantId, field, value, shouldRender = false) {
+  ensureCartParticipantRows();
+  const participant = state.public.cart.participants.find((entry) => entry.id === participantId);
+  if (!participant) {
+    return;
+  }
+
+  participant[field] =
+    field === "idNumber"
+      ? String(value || "").trim().toUpperCase().replace(/[\s-]/g, "")
+      : String(value || "");
+  state.public.cart.errors = {
+    ...state.public.cart.errors,
+    [`participant_${participantId}_${field}`]: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
+function toggleCartAssignment(participantId, itemId, checked, shouldRender = false) {
+  ensureCartParticipantRows();
+  const participant = state.public.cart.participants.find((entry) => entry.id === participantId);
+  if (!participant) {
+    return;
+  }
+
+  const assigned = new Set(participant.assignedItemIds || []);
+  if (checked) {
+    assigned.add(itemId);
+  } else {
+    assigned.delete(itemId);
+  }
+  participant.assignedItemIds = [...assigned];
+  state.public.cart.errors = {
+    ...state.public.cart.errors,
+    [`assignment_${itemId}`]: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
+function addCartParticipant() {
+  state.public.cart.participants.push(createCartParticipant(state.public.cart.participants.length));
+  renderPublicDetail();
+}
+
+function removeCartParticipant(participantId) {
+  if (state.public.cart.participants.length <= getRequiredCartParticipantCount()) {
+    return;
+  }
+
+  state.public.cart.participants = state.public.cart.participants.filter(
+    (participant) => participant.id !== participantId,
+  );
+  state.public.cart.errors = {};
+  renderPublicDetail();
+}
+
+async function submitCartCheckout() {
+  if (state.public.cart.submitting) {
+    return;
+  }
+
+  const errors = validateCartCheckout();
+  if (Object.keys(errors).length) {
+    state.public.cart.errors = errors;
+    renderPublicDetail();
+    return;
+  }
+
+  state.public.cart.submitting = true;
+  state.public.cart.errors = {};
+  renderPublicDetail();
+
+  try {
+    const payload = await api.checkoutCart(
+      getCartItems().map((item) => ({
+        clientItemId: item.id,
+        eventId: item.eventId,
+        quantity: item.quantity,
+        carpoolSelection: normalizeRunnerCarpoolSelection(item.carpoolSelection),
+      })),
+      state.public.cart.contact,
+      state.public.cart.participants.map((participant, index) => {
+        const normalized = normalizeCartParticipant(participant, index);
+        return {
+          id: normalized.id,
+          name: normalized.name,
+          phone: normalized.phone,
+          email: normalized.email,
+          idNumber: normalized.idNumber,
+          assignedItemIds: normalized.assignedItemIds,
+        };
+      }),
+    );
+
+    state.public.cart = {
+      items: [],
+      contact: {
+        name: "",
+        phone: "",
+        email: "",
+        note: "",
+      },
+      participants: [],
+      errors: {},
+      submitting: false,
+      success: {
+        orderId: payload.orderId,
+        totalPrice: payload.totalPrice,
+      },
+    };
+    await loadPublicEvents();
+    state.public.modalMode = "cart";
+    renderPublic();
+    showToast("訂單已送出。");
+  } catch (error) {
+    state.public.cart.submitting = false;
+    showToast(error.message || "訂單送出失敗。");
+    renderPublicDetail();
+  }
+}
+
+function resetCartSuccess() {
+  state.public.cart.success = null;
+  closePublicEvent();
 }
 
 function updateDraftPageField(pageId, field, value, shouldRender = false) {
@@ -3828,6 +5081,46 @@ function applyControlMutation(target, forceRender = false) {
     return;
   }
 
+  if (target.dataset.publicSpecField) {
+    updateEventSpecField(target.dataset.publicSpecField, target.value, shouldRender);
+    return;
+  }
+
+  if (target.dataset.publicSpecCarpoolField) {
+    updateEventSpecCarpoolSelection(
+      target.dataset.publicSpecCarpoolField,
+      target.value,
+      target instanceof HTMLInputElement ? target.checked : false,
+      shouldRender,
+    );
+    return;
+  }
+
+  if (target.dataset.cartContactField) {
+    updateCartContactField(target.dataset.cartContactField, target.value, shouldRender);
+    return;
+  }
+
+  if (target.dataset.cartParticipantField && target.dataset.cartParticipantId) {
+    updateCartParticipantField(
+      target.dataset.cartParticipantId,
+      target.dataset.cartParticipantField,
+      target.value,
+      shouldRender,
+    );
+    return;
+  }
+
+  if (target.dataset.cartAssignmentItemId && target.dataset.cartParticipantId) {
+    toggleCartAssignment(
+      target.dataset.cartParticipantId,
+      target.dataset.cartAssignmentItemId,
+      target instanceof HTMLInputElement ? target.checked : false,
+      shouldRender,
+    );
+    return;
+  }
+
   if (target.dataset.publicQuestion) {
     if (target instanceof HTMLInputElement && target.type === "checkbox") {
       updateRunnerAnswer(
@@ -3889,6 +5182,11 @@ document.addEventListener("click", async (event) => {
 
     if (action === "export-submissions") {
       exportSubmissionsToExcel();
+      return;
+    }
+
+    if (action === "export-all-submissions") {
+      exportAllSubmissionsToExcel();
       return;
     }
 
@@ -4036,6 +5334,41 @@ document.addEventListener("click", async (event) => {
     const action = publicAction.dataset.publicAction;
     const event = getSelectedPublicEvent();
     const runner = state.public.runner;
+
+    if (action === "open-cart") {
+      openCartCheckout();
+      return;
+    }
+
+    if (action === "add-to-cart") {
+      addSelectedEventToCart();
+      return;
+    }
+
+    if (action === "remove-cart-item" && publicAction.dataset.cartItemId) {
+      removeCartItem(publicAction.dataset.cartItemId);
+      return;
+    }
+
+    if (action === "add-checkout-participant") {
+      addCartParticipant();
+      return;
+    }
+
+    if (action === "remove-checkout-participant" && publicAction.dataset.participantId) {
+      removeCartParticipant(publicAction.dataset.participantId);
+      return;
+    }
+
+    if (action === "checkout-submit") {
+      await submitCartCheckout();
+      return;
+    }
+
+    if (action === "checkout-reset") {
+      resetCartSuccess();
+      return;
+    }
 
     if (action === "prev") {
       goToPreviousPage();

@@ -119,6 +119,132 @@ function formatCapacity(value) {
   return value == null ? "不限名額" : `${value} 人`;
 }
 
+function normalizeMoneyValue(value) {
+  if (value === "" || value == null) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Math.max(0, Math.round(parsed * 100) / 100);
+}
+
+function roundMoney(value) {
+  return Math.round(Number(value || 0) * 100) / 100;
+}
+
+function formatMoney(value) {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return "";
+  }
+
+  return new Intl.NumberFormat("zh-Hant-TW", {
+    style: "currency",
+    currency: "TWD",
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(Number(value));
+}
+
+function normalizeDateTimeValue(value) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) {
+    return "";
+  }
+
+  return parsed.toISOString();
+}
+
+function formatDateTimeLocal(value) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) {
+    return "";
+  }
+
+  const offsetMs = parsed.getTimezoneOffset() * 60 * 1000;
+  return new Date(parsed.getTime() - offsetMs).toISOString().slice(0, 16);
+}
+
+function createPricingConfig() {
+  return {
+    enabled: false,
+    originalPrice: null,
+    discountPrice: null,
+    groupEnabled: false,
+    groupThreshold: null,
+    groupPrice: null,
+    earlyBirdEnabled: false,
+    earlyBirdDeadline: "",
+    earlyBirdPrice: null,
+    confirmationFieldEnabled: false,
+    confirmationFieldLabel: "",
+    confirmationFieldPlaceholder: "",
+    confirmationFieldRequired: false,
+  };
+}
+
+function normalizePricingConfig(pricing) {
+  const fallback = createPricingConfig();
+
+  return {
+    enabled: Boolean(pricing?.enabled),
+    originalPrice: normalizeMoneyValue(pricing?.originalPrice),
+    discountPrice: normalizeMoneyValue(pricing?.discountPrice),
+    groupEnabled: Boolean(pricing?.groupEnabled),
+    groupThreshold:
+      pricing?.groupThreshold === "" || pricing?.groupThreshold == null
+        ? null
+        : Math.max(1, Number.parseInt(pricing.groupThreshold, 10) || 0) || null,
+    groupPrice: normalizeMoneyValue(pricing?.groupPrice),
+    earlyBirdEnabled: Boolean(pricing?.earlyBirdEnabled),
+    earlyBirdDeadline: normalizeDateTimeValue(pricing?.earlyBirdDeadline),
+    earlyBirdPrice: normalizeMoneyValue(pricing?.earlyBirdPrice),
+    confirmationFieldEnabled: Boolean(pricing?.confirmationFieldEnabled),
+    confirmationFieldLabel: String(
+      pricing?.confirmationFieldLabel || fallback.confirmationFieldLabel,
+    ).trim(),
+    confirmationFieldPlaceholder: String(
+      pricing?.confirmationFieldPlaceholder || fallback.confirmationFieldPlaceholder,
+    ).trim(),
+    confirmationFieldRequired: Boolean(pricing?.confirmationFieldRequired),
+  };
+}
+
+function normalizeSubmissionPricing(pricing) {
+  if (!pricing || typeof pricing !== "object") {
+    return null;
+  }
+
+  return {
+    tierKey: String(pricing?.tierKey || "").trim(),
+    tierLabel: String(pricing?.tierLabel || "").trim(),
+    unitPrice: normalizeMoneyValue(pricing?.unitPrice),
+    originalUnitPrice: normalizeMoneyValue(pricing?.originalUnitPrice),
+    totalPrice: normalizeMoneyValue(pricing?.totalPrice),
+    participants:
+      pricing?.participants == null
+        ? null
+        : Math.max(1, Number.parseInt(pricing.participants, 10) || 0) || null,
+    confirmationValue: String(pricing?.confirmationValue || "").trim(),
+    confirmationFieldLabel: String(pricing?.confirmationFieldLabel || "").trim(),
+  };
+}
+
+function hasPricingFeatureEnabled(event) {
+  return Boolean(event?.pricing?.enabled);
+}
+
 function summarizeRemainingCapacity(events) {
   const tracked = events.filter((event) => event.remainingCapacity != null);
   if (tracked.length === 0) {
@@ -203,6 +329,7 @@ function createEmptyEvent() {
     coverImage: "",
     capacity: 50,
     status: "published",
+    pricing: createPricingConfig(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     pages: [page],
@@ -266,6 +393,7 @@ function normalizeSubmission(submission) {
       ? submission.visitedPageIds.map((value) => String(value))
       : [],
     answers: submission?.answers && typeof submission.answers === "object" ? submission.answers : {},
+    pricing: normalizeSubmissionPricing(submission?.pricing),
     repeatedAnswers: Array.isArray(submission?.repeatedAnswers)
       ? submission.repeatedAnswers
           .map((entry, index) => ({
@@ -291,6 +419,7 @@ function normalizeEvent(event) {
         ? null
         : Math.max(1, Number.parseInt(event.capacity, 10) || 0) || null,
     status: event?.status === "draft" ? "draft" : "published",
+    pricing: normalizePricingConfig(event?.pricing),
     createdAt: event?.createdAt || new Date().toISOString(),
     updatedAt: event?.updatedAt || new Date().toISOString(),
     pages: (Array.isArray(event?.pages) && event.pages.length ? event.pages : [createPage()]).map(
@@ -312,6 +441,7 @@ function sanitizeEventForPublic(event) {
     capacity: normalized.capacity,
     remainingCapacity: computeRemainingCapacity(normalized),
     status: normalized.status,
+    pricing: deepClone(normalized.pricing),
     pages: deepClone(normalized.pages),
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
@@ -519,7 +649,24 @@ function moveRunnerToReviewStage(event, runner) {
   runner.returnToReview = false;
   runner.errors = {};
   runner.repeatErrors = {};
+  runner.reviewErrors = {};
   return true;
+}
+
+function validateReviewStage(event, runner) {
+  const pricing = normalizePricingConfig(event?.pricing);
+  const errors = {};
+
+  if (
+    pricing.enabled &&
+    pricing.confirmationFieldEnabled &&
+    pricing.confirmationFieldRequired &&
+    !String(runner?.pricingConfirmationValue || "").trim()
+  ) {
+    errors.pricingConfirmation = `${pricing.confirmationFieldLabel || "確認欄位"} 為必填。`;
+  }
+
+  return errors;
 }
 
 function getReviewSections(event, runner) {
@@ -585,6 +732,7 @@ function jumpToFlowQuestionFromReview(event, runner, pageId) {
     pageIndex >= 0 ? flowState.visitedPageIds.slice(0, pageIndex + 1) : [pageId];
   runner.errors = {};
   runner.returnToReview = true;
+  runner.reviewErrors = {};
 }
 
 function jumpToRepeatQuestionFromReview(event, runner, participantNumber) {
@@ -592,6 +740,7 @@ function jumpToRepeatQuestionFromReview(event, runner, participantNumber) {
   runner.repeatParticipantNumber = participantNumber;
   runner.repeatErrors = {};
   runner.returnToReview = true;
+  runner.reviewErrors = {};
   ensureRepeatAnswerEntry(event, runner, participantNumber);
 }
 
@@ -775,6 +924,170 @@ function computeParticipantsFromAnswers(event, answers) {
   return Math.max(1, total);
 }
 
+function hasParticipantCountInput(event, answers) {
+  const normalizedAnswers = normalizeAnswersForEvent(event, answers);
+  const trackedQuestions = event.pages
+    .flatMap((page) => page.questions)
+    .filter((question) => question.countsTowardCapacity);
+
+  if (trackedQuestions.length === 0) {
+    return true;
+  }
+
+  return trackedQuestions.some((question) => normalizedAnswers[question.id] !== "");
+}
+
+function getPricingQuote(event, answers, referenceTime = new Date().toISOString()) {
+  const pricing = normalizePricingConfig(event?.pricing);
+  if (!pricing.enabled) {
+    return null;
+  }
+
+  const participants = computeParticipantsFromAnswers(event, answers);
+  const candidates = [];
+  const basePrice = pricing.discountPrice ?? pricing.originalPrice;
+
+  if (basePrice != null) {
+    candidates.push({
+      tierKey: pricing.discountPrice != null ? "discount" : "original",
+      tierLabel: pricing.discountPrice != null ? "優惠價" : "原價",
+      unitPrice: basePrice,
+      priority: 1,
+    });
+  }
+
+  if (
+    pricing.groupEnabled &&
+    pricing.groupThreshold != null &&
+    pricing.groupPrice != null &&
+    participants >= pricing.groupThreshold
+  ) {
+    candidates.push({
+      tierKey: "group",
+      tierLabel: `團體價（${pricing.groupThreshold} 人以上）`,
+      unitPrice: pricing.groupPrice,
+      priority: 2,
+    });
+  }
+
+  if (
+    pricing.earlyBirdEnabled &&
+    pricing.earlyBirdDeadline &&
+    pricing.earlyBirdPrice != null &&
+    new Date(referenceTime).valueOf() <= new Date(pricing.earlyBirdDeadline).valueOf()
+  ) {
+    candidates.push({
+      tierKey: "earlyBird",
+      tierLabel: "早鳥價",
+      unitPrice: pricing.earlyBirdPrice,
+      priority: 3,
+    });
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    if (left.unitPrice !== right.unitPrice) {
+      return left.unitPrice - right.unitPrice;
+    }
+    return right.priority - left.priority;
+  });
+
+  const applied = candidates[0];
+  const originalUnitPrice =
+    pricing.originalPrice != null && pricing.originalPrice > applied.unitPrice
+      ? pricing.originalPrice
+      : null;
+
+  return {
+    tierKey: applied.tierKey,
+    tierLabel: applied.tierLabel,
+    unitPrice: applied.unitPrice,
+    originalUnitPrice,
+    totalPrice: roundMoney(applied.unitPrice * participants),
+    participants,
+    confirmationFieldEnabled: pricing.confirmationFieldEnabled,
+    confirmationFieldLabel: pricing.confirmationFieldLabel,
+    confirmationFieldPlaceholder: pricing.confirmationFieldPlaceholder,
+    confirmationFieldRequired: pricing.confirmationFieldRequired,
+    earlyBirdDeadline: pricing.earlyBirdDeadline,
+  };
+}
+
+function renderPricingSummary(event, answers, options = {}) {
+  const quote = getPricingQuote(event, answers, options.referenceTime);
+  const pricing = normalizePricingConfig(event?.pricing);
+  const showConfirmationField = Boolean(options.showConfirmationField && pricing.confirmationFieldEnabled);
+  if (!quote && !showConfirmationField) {
+    return "";
+  }
+
+  const confirmationValue = options.confirmationValue || "";
+  const confirmationError = options.confirmationError || "";
+
+  return `
+    <section class="price-card ${options.compact ? "price-card-compact" : ""}">
+      <div class="split-row review-section-header">
+        <div>
+          <h4>${escapeHtml(options.title || "價格確認")}</h4>
+          <p class="field-help">${
+            quote
+              ? "系統會依人數、早鳥時間與團體條件自動套用最合適的價格。"
+              : "目前尚未設定可套用的價格，但你仍可使用下方確認欄位。"
+          }</p>
+        </div>
+        ${
+          quote
+            ? `<div class="price-total-copy">${escapeHtml(formatMoney(quote.totalPrice))}</div>`
+            : ""
+        }
+      </div>
+      ${
+        quote
+          ? `
+            <div class="price-line">
+              ${
+                quote.originalUnitPrice != null
+                  ? `<span class="price-original">${escapeHtml(formatMoney(quote.originalUnitPrice))} / 人</span>`
+                  : ""
+              }
+              <span class="price-current">${escapeHtml(quote.tierLabel)} ${escapeHtml(formatMoney(quote.unitPrice))} / 人</span>
+            </div>
+            <div class="meta-row" style="margin-top: 12px;">
+              <span class="meta-pill">${quote.participants} 人</span>
+              <span class="meta-pill">${escapeHtml(quote.tierLabel)}</span>
+              <span class="meta-pill">總計 ${escapeHtml(formatMoney(quote.totalPrice))}</span>
+            </div>
+          `
+          : ""
+      }
+      ${
+        showConfirmationField
+          ? `
+            <div class="field" style="margin-top: 16px;">
+              <label>${escapeHtml(pricing.confirmationFieldLabel || "確認欄位")}</label>
+              <input
+                class="input"
+                type="text"
+                value="${escapeHtml(confirmationValue)}"
+                placeholder="${escapeHtml(pricing.confirmationFieldPlaceholder || "")}"
+                data-public-pricing-confirmation="true"
+              />
+              ${
+                confirmationError
+                  ? `<div class="question-error">${escapeHtml(confirmationError)}</div>`
+                  : ""
+              }
+            </div>
+          `
+          : ""
+      }
+    </section>
+  `;
+}
+
 function cleanFlowReferences(event) {
   const pageIds = new Set(event.pages.map((page) => page.id));
 
@@ -891,13 +1204,14 @@ const api = {
     });
   },
 
-  async submitRegistration(eventId, answers, repeatedAnswers = []) {
+  async submitRegistration(eventId, answers, repeatedAnswers = [], pricingConfirmationValue = "") {
     return requestRemote("register", {
       method: "POST",
       body: JSON.stringify({
         eventId,
         answers,
         repeatedAnswers,
+        pricingConfirmationValue,
       }),
     });
   },
@@ -947,6 +1261,8 @@ function ensureRunnerForEvent(eventId) {
     repeatParticipantNumber: 2,
     finalParticipantCount: 1,
     returnToReview: false,
+    pricingConfirmationValue: "",
+    reviewErrors: {},
     submitting: false,
     submitted: false,
     success: null,
@@ -1206,6 +1522,7 @@ function renderPublicDetail() {
   if (runner?.stage === "review") {
     const reviewSections = getReviewSections(event, runner);
     const totalParticipants = Math.max(1, runner.finalParticipantCount || 1);
+    const reviewErrors = runner.reviewErrors || {};
 
     dom.publicDetail.innerHTML = `
       <div class="registration-shell">
@@ -1262,6 +1579,16 @@ function renderPublicDetail() {
             )
             .join("")}
         </div>
+        ${
+          hasPricingFeatureEnabled(event)
+            ? renderPricingSummary(event, runner.answers, {
+                title: "價格確認",
+                showConfirmationField: true,
+                confirmationValue: runner.pricingConfirmationValue,
+                confirmationError: reviewErrors.pricingConfirmation,
+              })
+            : ""
+        }
         <div class="action-row" style="margin-top: 24px;">
           <button class="secondary-button" type="button" data-public-action="review-back">返回上一段</button>
           <button class="primary-button" type="button" data-public-action="submit" ${runner.submitting ? "disabled" : ""}>
@@ -1305,6 +1632,14 @@ function renderPublicDetail() {
           <span class="meta-pill">同行資料</span>
           <span class="meta-pill">第 ${runner.repeatParticipantNumber} 位 / 共 ${totalParticipants} 位</span>
         </div>
+        ${
+          hasPricingFeatureEnabled(event)
+            ? renderPricingSummary(event, runner.answers, {
+                title: "目前價格試算",
+                compact: true,
+              })
+            : ""
+        }
         ${
           isFull
             ? `<div class="empty-state" style="margin-top: 20px;"><h3>這個活動目前已額滿</h3></div>`
@@ -1363,6 +1698,11 @@ function renderPublicDetail() {
     isFinalPage &&
     computeParticipantsFromAnswers(event, runner.answers) > 1 &&
     repeatQuestions.length > 0;
+  const pricingAnchorQuestionId = currentPage.questions.find(
+    (question) => question.countsTowardCapacity,
+  )?.id;
+  const showPricingPreview =
+    hasPricingFeatureEnabled(event) && hasParticipantCountInput(event, runner.answers);
 
   dom.publicDetail.innerHTML = `
     <div class="registration-shell">
@@ -1409,6 +1749,14 @@ function renderPublicDetail() {
                     <div style="margin-top: 12px;">
                       ${renderInputField(question, value, error)}
                     </div>
+                    ${
+                      showPricingPreview && question.id === pricingAnchorQuestionId
+                        ? renderPricingSummary(event, runner.answers, {
+                            title: "目前價格試算",
+                            compact: true,
+                          })
+                        : ""
+                    }
                   </div>
                 `;
               })
@@ -1782,7 +2130,32 @@ function getSubmissionColumns(event) {
     }
   }
 
-  return [...baseColumns, ...repeatedColumns];
+  const pricingColumns = [];
+  const hasPricingData = (event.submissions || []).some((submission) => submission.pricing);
+  if (hasPricingData) {
+    pricingColumns.push(
+      { kind: "pricing", field: "tierLabel", header: "價格方案" },
+      { kind: "pricing", field: "unitPrice", header: "單價" },
+      { kind: "pricing", field: "originalUnitPrice", header: "原價" },
+      { kind: "pricing", field: "totalPrice", header: "價格總計" },
+    );
+
+    const confirmationLabel =
+      normalizePricingConfig(event.pricing).confirmationFieldLabel ||
+      (event.submissions || []).find((submission) => submission.pricing?.confirmationFieldLabel)
+        ?.pricing?.confirmationFieldLabel ||
+      "確認欄位";
+
+    if ((event.submissions || []).some((submission) => submission.pricing?.confirmationValue)) {
+      pricingColumns.push({
+        kind: "pricing",
+        field: "confirmationValue",
+        header: confirmationLabel,
+      });
+    }
+  }
+
+  return [...baseColumns, ...repeatedColumns, ...pricingColumns];
 }
 
 function formatSubmissionAnswer(question, answer) {
@@ -1827,6 +2200,14 @@ function getSubmissionRows(event) {
         totalParticipants: submission.totalParticipants,
         visitedPages,
         answers: columns.map((column) => {
+          if (column.kind === "pricing") {
+            const pricingValue = submission.pricing?.[column.field];
+            if (column.field === "unitPrice" || column.field === "originalUnitPrice" || column.field === "totalPrice") {
+              return pricingValue == null ? "" : formatMoney(pricingValue);
+            }
+            return pricingValue == null ? "" : String(pricingValue);
+          }
+
           if (column.participantNumber) {
             const repeatedEntry = (submission.repeatedAnswers || []).find(
               (entry) => entry.participantNumber === column.participantNumber,
@@ -1949,6 +2330,94 @@ function exportSubmissionsToExcel() {
   showToast("報名資料已匯出。");
 }
 
+function renderPricingEditor(event) {
+  const pricing = normalizePricingConfig(event?.pricing);
+
+  return `
+    <div class="editor-card">
+      <div class="section-header">
+        <div>
+          <h3>價格設定</h3>
+          <p class="field-help">整包功能可選擇開啟；關閉時前台不會顯示任何價格內容。</p>
+        </div>
+        <label class="inline-checkbox">
+          <input type="checkbox" data-pricing-field="enabled" ${pricing.enabled ? "checked" : ""} />
+          <span>啟用價格功能</span>
+        </label>
+      </div>
+      ${
+        pricing.enabled
+          ? `
+            <div class="field-grid two">
+              <div class="field">
+                <label>原價</label>
+                <input class="input" type="number" min="0" step="0.01" value="${escapeHtml(pricing.originalPrice ?? "")}" data-pricing-field="originalPrice" placeholder="例如 1200" />
+              </div>
+              <div class="field">
+                <label>目前售價 / 優惠價</label>
+                <input class="input" type="number" min="0" step="0.01" value="${escapeHtml(pricing.discountPrice ?? "")}" data-pricing-field="discountPrice" placeholder="例如 999" />
+                <p class="field-help">若只填原價不填優惠價，系統會以原價計算。</p>
+              </div>
+            </div>
+
+            <div class="subtle-divider"></div>
+
+            <div class="field-grid two">
+              <div class="field">
+                <label class="inline-checkbox">
+                  <input type="checkbox" data-pricing-field="groupEnabled" ${pricing.groupEnabled ? "checked" : ""} />
+                  <span>啟用團體價</span>
+                </label>
+                <input class="input" type="number" min="1" value="${escapeHtml(pricing.groupThreshold ?? "")}" data-pricing-field="groupThreshold" placeholder="滿幾人啟用" />
+              </div>
+              <div class="field">
+                <label>團體價</label>
+                <input class="input" type="number" min="0" step="0.01" value="${escapeHtml(pricing.groupPrice ?? "")}" data-pricing-field="groupPrice" placeholder="例如 850" />
+                <p class="field-help">當報名總人數達到門檻時，系統會自動比較並套用較低單價。</p>
+              </div>
+            </div>
+
+            <div class="field-grid two">
+              <div class="field">
+                <label class="inline-checkbox">
+                  <input type="checkbox" data-pricing-field="earlyBirdEnabled" ${pricing.earlyBirdEnabled ? "checked" : ""} />
+                  <span>啟用早鳥價</span>
+                </label>
+                <input class="input" type="datetime-local" value="${escapeHtml(formatDateTimeLocal(pricing.earlyBirdDeadline))}" data-pricing-field="earlyBirdDeadline" />
+              </div>
+              <div class="field">
+                <label>早鳥價</label>
+                <input class="input" type="number" min="0" step="0.01" value="${escapeHtml(pricing.earlyBirdPrice ?? "")}" data-pricing-field="earlyBirdPrice" placeholder="例如 900" />
+                <p class="field-help">若早鳥與團體條件同時成立，系統會自動套用較低價格。</p>
+              </div>
+            </div>
+
+            <div class="subtle-divider"></div>
+
+            <div class="field-grid two">
+              <div class="field">
+                <label class="inline-checkbox">
+                  <input type="checkbox" data-pricing-field="confirmationFieldEnabled" ${pricing.confirmationFieldEnabled ? "checked" : ""} />
+                  <span>確認頁顯示自訂輸入欄</span>
+                </label>
+                <input class="input" type="text" value="${escapeHtml(pricing.confirmationFieldLabel)}" data-pricing-field="confirmationFieldLabel" placeholder="例如：匯款後五碼 / 備註" />
+              </div>
+              <div class="field">
+                <label>輸入框提示文字</label>
+                <input class="input" type="text" value="${escapeHtml(pricing.confirmationFieldPlaceholder)}" data-pricing-field="confirmationFieldPlaceholder" placeholder="例如：請輸入匯款後五碼" />
+                <label class="inline-checkbox" style="margin-top: 10px;">
+                  <input type="checkbox" data-pricing-field="confirmationFieldRequired" ${pricing.confirmationFieldRequired ? "checked" : ""} />
+                  <span>這個確認欄位必填</span>
+                </label>
+              </div>
+            </div>
+          `
+          : `<div class="empty-state"><h4>目前未啟用價格功能</h4><p class="muted-text">前台將維持現在的純報名表單樣式，不顯示價格與試算。</p></div>`
+      }
+    </div>
+  `;
+}
+
 function renderAdminEditor() {
   const draft = state.admin.draft;
   if (!draft) {
@@ -2061,6 +2530,8 @@ function renderAdminEditor() {
             </div>
           </div>
         </div>
+
+        ${renderPricingEditor(draft)}
 
         <div class="editor-card">
           <div class="section-header">
@@ -2398,6 +2869,38 @@ function updateDraftEventField(field, value, shouldRender = false) {
   markDraftDirty(shouldRender);
 }
 
+function updateDraftPricingField(field, value, checked, shouldRender = false) {
+  if (!state.admin.draft) {
+    return;
+  }
+
+  const pricing = state.admin.draft.pricing || createPricingConfig();
+  const checkboxFields = new Set([
+    "enabled",
+    "groupEnabled",
+    "earlyBirdEnabled",
+    "confirmationFieldEnabled",
+    "confirmationFieldRequired",
+  ]);
+  const moneyFields = new Set(["originalPrice", "discountPrice", "groupPrice", "earlyBirdPrice"]);
+
+  if (checkboxFields.has(field)) {
+    pricing[field] = checked;
+  } else if (field === "groupThreshold") {
+    pricing.groupThreshold =
+      value === "" ? null : Math.max(1, Number.parseInt(value, 10) || 0) || null;
+  } else if (moneyFields.has(field)) {
+    pricing[field] = normalizeMoneyValue(value);
+  } else if (field === "earlyBirdDeadline") {
+    pricing.earlyBirdDeadline = normalizeDateTimeValue(value);
+  } else {
+    pricing[field] = String(value || "");
+  }
+
+  state.admin.draft.pricing = normalizePricingConfig(pricing);
+  markDraftDirty(shouldRender);
+}
+
 function updateDraftPageField(pageId, field, value, shouldRender = false) {
   const page = findPage(pageId);
   if (!page) {
@@ -2509,6 +3012,23 @@ function updateRunnerAnswer(questionId, value, checked, shouldRender = false) {
   }
 }
 
+function updateRunnerPricingConfirmation(value, shouldRender = false) {
+  const runner = state.public.runner;
+  if (!runner) {
+    return;
+  }
+
+  runner.pricingConfirmationValue = String(value || "");
+  runner.reviewErrors = {
+    ...runner.reviewErrors,
+    pricingConfirmation: "",
+  };
+
+  if (shouldRender) {
+    renderPublicDetail();
+  }
+}
+
 function goToPreviousPage() {
   const event = getSelectedPublicEvent();
   const runner = state.public.runner;
@@ -2586,6 +3106,13 @@ async function submitRegistration() {
   }
 
   if (runner.stage === "review") {
+    const reviewErrors = validateReviewStage(event, runner);
+    if (Object.keys(reviewErrors).length) {
+      runner.reviewErrors = reviewErrors;
+      renderPublicDetail();
+      return;
+    }
+
     runner.submitting = true;
     renderPublicDetail();
 
@@ -2596,6 +3123,7 @@ async function submitRegistration() {
         normalizeRepeatedAnswersForEvent(event, runner.repeatedAnswers).filter(
           (entry) => entry.participantNumber <= Math.max(1, runner.finalParticipantCount || 1),
         ),
+        runner.pricingConfirmationValue,
       );
       runner.submitted = true;
       runner.success = {
@@ -2698,6 +3226,8 @@ function restartRegistration() {
     repeatParticipantNumber: 2,
     finalParticipantCount: 1,
     returnToReview: false,
+    pricingConfirmationValue: "",
+    reviewErrors: {},
     submitting: false,
     submitted: false,
     success: null,
@@ -2802,6 +3332,16 @@ function applyControlMutation(target, forceRender = false) {
     return;
   }
 
+  if (target.dataset.pricingField) {
+    updateDraftPricingField(
+      target.dataset.pricingField,
+      target.value,
+      target instanceof HTMLInputElement ? target.checked : false,
+      shouldRender,
+    );
+    return;
+  }
+
   if (target.dataset.optionField && target.dataset.questionId && target.dataset.optionId) {
     updateDraftOptionField(
       target.dataset.questionId,
@@ -2810,6 +3350,11 @@ function applyControlMutation(target, forceRender = false) {
       target.value,
       shouldRender,
     );
+    return;
+  }
+
+  if (target.dataset.publicPricingConfirmation) {
+    updateRunnerPricingConfirmation(target.value, shouldRender);
     return;
   }
 

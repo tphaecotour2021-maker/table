@@ -496,6 +496,41 @@ button:disabled {
   margin-top: 18px;
 }
 
+.price-card {
+  margin-top: 16px;
+  border: 1px solid rgba(181, 72, 47, 0.16);
+  border-radius: 18px;
+  background: rgba(255, 248, 241, 0.92);
+  padding: 16px;
+}
+
+.price-card-compact {
+  margin-top: 14px;
+}
+
+.price-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: baseline;
+  margin-top: 10px;
+}
+
+.price-original {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.price-current,
+.price-total-copy {
+  color: var(--accent-deep);
+  font-weight: 800;
+}
+
+.price-total-copy {
+  font-size: 1.12rem;
+}
+
 .review-list,
 .review-item-list {
   display: grid;

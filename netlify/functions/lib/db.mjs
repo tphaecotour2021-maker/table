@@ -78,6 +78,15 @@ export function createPricingConfig() {
   };
 }
 
+export function createCarpoolConfig() {
+  return {
+    enabled: false,
+    price: null,
+    capacity: null,
+    description: "",
+  };
+}
+
 export function normalizePricingConfig(pricing) {
   const fallback = createPricingConfig();
 
@@ -105,6 +114,18 @@ export function normalizePricingConfig(pricing) {
   };
 }
 
+export function normalizeCarpoolConfig(carpool) {
+  return {
+    enabled: Boolean(carpool?.enabled),
+    price: normalizeMoneyValue(carpool?.price),
+    capacity:
+      carpool?.capacity === "" || carpool?.capacity == null
+        ? null
+        : Math.max(1, Number.parseInt(carpool.capacity, 10) || 0) || null,
+    description: String(carpool?.description || "").trim(),
+  };
+}
+
 function normalizeSubmissionPricing(pricing) {
   if (!pricing || typeof pricing !== "object") {
     return null;
@@ -122,6 +143,24 @@ function normalizeSubmissionPricing(pricing) {
         : Math.max(1, Number.parseInt(pricing.participants, 10) || 0) || null,
     confirmationValue: String(pricing?.confirmationValue || "").trim(),
     confirmationFieldLabel: String(pricing?.confirmationFieldLabel || "").trim(),
+  };
+}
+
+function normalizeSubmissionCarpool(carpool) {
+  if (!carpool || typeof carpool !== "object") {
+    return null;
+  }
+
+  const quantity = Math.max(0, Number.parseInt(carpool?.quantity, 10) || 0);
+  if (quantity <= 0) {
+    return null;
+  }
+
+  return {
+    quantity,
+    unitPrice: normalizeMoneyValue(carpool?.unitPrice),
+    totalPrice: normalizeMoneyValue(carpool?.totalPrice),
+    description: String(carpool?.description || "").trim(),
   };
 }
 
@@ -203,6 +242,7 @@ export function normalizeEvent(event) {
         : Math.max(1, Number.parseInt(event.capacity, 10) || 0) || null,
     status: event?.status === "draft" ? "draft" : "published",
     pricing: normalizePricingConfig(event?.pricing),
+    carpool: normalizeCarpoolConfig(event?.carpool),
     createdAt: event?.createdAt || now,
     updatedAt: event?.updatedAt || now,
     pages: pages.map((page, index) => normalizePage(page, index)),
@@ -299,6 +339,7 @@ function normalizeSubmission(submission) {
       : [],
     answers: typeof submission?.answers === "object" && submission.answers ? submission.answers : {},
     pricing: normalizeSubmissionPricing(submission?.pricing),
+    carpool: normalizeSubmissionCarpool(submission?.carpool),
     repeatedAnswers: Array.isArray(submission?.repeatedAnswers)
       ? submission.repeatedAnswers
           .map((entry, index) => ({
@@ -330,6 +371,22 @@ export function computeRemainingCapacity(event) {
   }
 
   return Math.max(0, event.capacity - computeUsedCapacity(event));
+}
+
+export function computeUsedCarpoolCapacity(event) {
+  return (event?.submissions || []).reduce(
+    (sum, submission) => sum + (Number.parseInt(submission.carpool?.quantity, 10) || 0),
+    0,
+  );
+}
+
+export function computeRemainingCarpoolCapacity(event) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  if (!carpool.enabled || carpool.capacity == null) {
+    return null;
+  }
+
+  return Math.max(0, carpool.capacity - computeUsedCarpoolCapacity(event));
 }
 
 function findQuestionById(event, questionId) {
@@ -427,6 +484,24 @@ function sanitizeRepeatedAnswersForStorage(event, repeatedAnswers) {
   );
 }
 
+function sanitizeCarpoolSelection(event, carpoolSelection) {
+  const carpool = normalizeCarpoolConfig(event?.carpool);
+  const source = typeof carpoolSelection === "object" && carpoolSelection ? carpoolSelection : {};
+  const requested = Boolean(source.requested);
+  const quantity = requested ? Math.max(1, Number.parseInt(source.quantity, 10) || 1) : 0;
+
+  if (!carpool.enabled || !requested || quantity <= 0) {
+    return null;
+  }
+
+  return {
+    quantity,
+    unitPrice: carpool.price ?? 0,
+    totalPrice: roundMoney((carpool.price ?? 0) * quantity),
+    description: carpool.description,
+  };
+}
+
 function isAnswerEmpty(question, answer) {
   if (question.type === "multiChoice") {
     return !Array.isArray(answer) || answer.length === 0;
@@ -520,6 +595,7 @@ export function validateSubmission(
   repeatedAnswers,
   pricingConfirmationValue = "",
   referenceTime = new Date().toISOString(),
+  carpoolSelection = {},
 ) {
   const sanitizedAnswers = sanitizeAnswersForStorage(event, answers);
   const totalParticipants = computeSubmissionParticipants(event, sanitizedAnswers);
@@ -529,6 +605,7 @@ export function validateSubmission(
   ).filter((entry) => entry.participantNumber <= totalParticipants);
   const repeatQuestions = getRepeatQuestions(event);
   const pricing = normalizePricingConfig(event?.pricing);
+  const sanitizedCarpool = sanitizeCarpoolSelection(event, carpoolSelection);
   const normalizedPricingConfirmationValue = String(pricingConfirmationValue || "").trim();
   const errors = [];
   const visitedPageIds = [];
@@ -591,6 +668,13 @@ export function validateSubmission(
   }
 
   const pricingQuote = computePricingQuote(event, sanitizedAnswers, referenceTime);
+  if (sanitizedCarpool && sanitizedCarpool.quantity > totalParticipants) {
+    errors.push({
+      pageId: null,
+      questionId: "__carpool__",
+      message: `共乘人數不能超過報名總人數 ${totalParticipants} 人。`,
+    });
+  }
 
   return {
     ok: errors.length === 0,
@@ -600,6 +684,7 @@ export function validateSubmission(
     sanitizedRepeatedAnswers,
     totalParticipants,
     pricingQuote,
+    sanitizedCarpool,
     pricingConfirmationValue: normalizedPricingConfirmationValue,
   };
 }
@@ -707,6 +792,10 @@ export function sanitizeEventForPublic(event) {
     remainingCapacity: computeRemainingCapacity(event),
     status: event.status,
     pricing: clone(event.pricing),
+    carpool: {
+      ...clone(event.carpool),
+      remainingCapacity: computeRemainingCarpoolCapacity(event),
+    },
     createdAt: event.createdAt,
     updatedAt: event.updatedAt,
     pages: clone(event.pages),

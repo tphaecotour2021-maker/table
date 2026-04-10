@@ -37,6 +37,7 @@ export default async (request) => {
     const eventId = String(body?.eventId || "").trim();
     const answers = body?.answers;
     const repeatedAnswers = body?.repeatedAnswers;
+    const pricingConfirmationValue = body?.pricingConfirmationValue;
 
     if (!eventId) {
       return json({ ok: false, error: "缺少活動 ID。" }, 400);
@@ -44,12 +45,19 @@ export default async (request) => {
 
     const database = await loadDatabase();
     const event = getEvent(database, eventId);
+    const submittedAt = new Date().toISOString();
 
     if (!event || event.status !== "published") {
       return json({ ok: false, error: "找不到可報名的活動。" }, 404);
     }
 
-    const validation = validateSubmission(event, answers, repeatedAnswers);
+    const validation = validateSubmission(
+      event,
+      answers,
+      repeatedAnswers,
+      pricingConfirmationValue,
+      submittedAt,
+    );
 
     if (!validation.ok) {
       return json(
@@ -78,10 +86,20 @@ export default async (request) => {
 
     event.submissions.push({
       id: createId("submission"),
-      submittedAt: new Date().toISOString(),
+      submittedAt,
       totalParticipants,
       visitedPageIds: validation.visitedPageIds,
       answers: validation.sanitizedAnswers,
+      pricing: validation.pricingQuote || validation.pricingConfirmationValue
+        ? {
+            ...(validation.pricingQuote || {}),
+            confirmationValue: validation.pricingConfirmationValue,
+            confirmationFieldLabel:
+              validation.pricingQuote?.confirmationFieldLabel ||
+              event.pricing?.confirmationFieldLabel ||
+              "",
+          }
+        : null,
       repeatedAnswers: validation.sanitizedRepeatedAnswers,
     });
     event.updatedAt = new Date().toISOString();

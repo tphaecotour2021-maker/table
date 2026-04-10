@@ -1,5 +1,6 @@
 import {
   buildSubmissionSummary,
+  computeRemainingCarpoolCapacity,
   createId,
   getEvent,
   loadDatabase,
@@ -38,6 +39,7 @@ export default async (request) => {
     const answers = body?.answers;
     const repeatedAnswers = body?.repeatedAnswers;
     const pricingConfirmationValue = body?.pricingConfirmationValue;
+    const carpoolSelection = body?.carpoolSelection;
 
     if (!eventId) {
       return json({ ok: false, error: "缺少活動 ID。" }, 400);
@@ -57,6 +59,7 @@ export default async (request) => {
       repeatedAnswers,
       pricingConfirmationValue,
       submittedAt,
+      carpoolSelection,
     );
 
     if (!validation.ok) {
@@ -84,6 +87,19 @@ export default async (request) => {
       );
     }
 
+    const carpoolQuantity = validation.sanitizedCarpool?.quantity || 0;
+    const remainingCarpoolCapacity = computeRemainingCarpoolCapacity(event);
+    if (remainingCarpoolCapacity != null && carpoolQuantity > remainingCarpoolCapacity) {
+      return json(
+        {
+          ok: false,
+          error: `共乘名額不足，目前只剩 ${remainingCarpoolCapacity} 位。`,
+          remainingCarpoolCapacity,
+        },
+        409,
+      );
+    }
+
     event.submissions.push({
       id: createId("submission"),
       submittedAt,
@@ -100,6 +116,7 @@ export default async (request) => {
               "",
           }
         : null,
+      carpool: validation.sanitizedCarpool,
       repeatedAnswers: validation.sanitizedRepeatedAnswers,
     });
     event.updatedAt = new Date().toISOString();
